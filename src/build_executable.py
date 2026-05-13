@@ -4,6 +4,7 @@ Build script for creating SpotlessFilm executable
 This script handles the entire build process including dependency checks
 """
 
+import importlib.util
 import subprocess
 import sys
 import os
@@ -13,7 +14,8 @@ from pathlib import Path
 def check_pyinstaller():
     """Check if PyInstaller is installed, install if not"""
     try:
-        import PyInstaller
+        if importlib.util.find_spec("PyInstaller") is None:
+            raise ImportError()
         print("✅ PyInstaller is already installed")
     except ImportError:
         print("📦 Installing PyInstaller...")
@@ -26,6 +28,7 @@ def check_dependencies():
         "torch",
         "torchvision",
         "pillow",
+        "IOPaint",
         "customtkinter",
         "tkinterdnd2",
         "opencv-python",
@@ -35,6 +38,7 @@ def check_dependencies():
         "opencv-python": "cv2",
         "pillow": "PIL",
         "tkinterdnd2": "tkinterdnd2",
+        "IOPaint": "iopaint",
     }
 
     missing_packages = []
@@ -50,6 +54,20 @@ def check_dependencies():
         print(f"📦 Installing missing packages: {', '.join(missing_packages)}")
         subprocess.check_call([sys.executable, "-m", "pip", "install"] + missing_packages)
         print("✅ All dependencies installed")
+
+def ensure_lama_checkpoint_for_bundle():
+    """Fetch big-lama.pt so PyInstaller can ship offline LaMa (see spotless_film.spec)."""
+    script = Path(__file__).resolve().parent / "scripts" / "fetch_lama_checkpoint.py"
+    if not script.is_file():
+        print("⚠️  fetch_lama_checkpoint.py not found, skipping LaMa bundle prefetch")
+        return
+    code = subprocess.run([sys.executable, str(script)])
+    if code.returncode != 0:
+        raise RuntimeError(
+            "LaMa checkpoint download failed. "
+            "Run from src/: python scripts/fetch_lama_checkpoint.py — required for packaged LaMa."
+        )
+
 
 def clean_build():
     """Clean previous build artifacts"""
@@ -83,7 +101,7 @@ def build_executable():
         
         # Show output location
         if system == "Darwin":
-            print(f"📦 App bundle created: dist/SpotlessFilm.app")
+            print("📦 App bundle created: dist/SpotlessFilm.app")
         else:
             print(f"📦 Executable created: dist/SpotlessFilm{'.exe' if system == 'Windows' else ''}")
             
@@ -166,7 +184,8 @@ def main():
         # Step 1: Check and install dependencies
         check_pyinstaller()
         check_dependencies()
-        
+        ensure_lama_checkpoint_for_bundle()
+
         # Step 2: Clean previous builds
         clean_build()
         

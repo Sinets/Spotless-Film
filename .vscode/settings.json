@@ -1,5 +1,20 @@
 {
     "cSpell.words": [
         "squiggliness"
-    ]
+    ],
+    "files.watcherExclude": {
+        "**/src/build/**": true,
+        "**/src/dist/**": true,
+        "**/src/distribution/**": true
+    },
+    "search.exclude": {
+        "**/src/build": true,
+        "**/src/dist": true,
+        "**/src/distribution": true
+    },
+    "files.exclude": {
+        "**/src/build": true,
+        "**/src/dist": true,
+        "**/src/distribution": true
+    }
 }

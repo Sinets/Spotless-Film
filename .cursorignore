@@ -1,0 +1,11 @@
+# Build / bundle outputs (keep agent context on source)
+src/build/
+src/dist/
+src/distribution/
+Spotless-Film.app/
+SpotlessFilm.app/
+spotless-film-app/
+build-dmg/
+dust_remover/
+*.mlmodelc/
+

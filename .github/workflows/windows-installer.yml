@@ -30,6 +30,10 @@ jobs:
           pip install -r src/requirements_spotless_film.txt
           pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 
+      - name: Prefetch LaMa weights (bundled with PyInstaller)
+        shell: bash
+        run: python src/scripts/fetch_lama_checkpoint.py
+
       - name: PyInstaller (spec)
         working-directory: src
         run: pyinstaller --clean --noconfirm spotless_film.spec

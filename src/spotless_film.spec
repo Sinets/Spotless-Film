@@ -19,12 +19,39 @@ if _weights.is_dir():
     for _w in sorted(_weights.glob("*.pth")):
         datas.append((str(_w), "weights"))
 
+# IOPaint LaMa JIT checkpoint; run scripts/fetch_lama_checkpoint.py before build.
+_lama_ckpt = (
+    Path(_SPEC_ROOT)
+    / "bundle_models"
+    / "torch_cache"
+    / "hub"
+    / "checkpoints"
+    / "big-lama.pt"
+)
+if _lama_ckpt.is_file():
+    datas.append((str(_lama_ckpt), "torch_cache/hub/checkpoints"))
+
 # CustomTkinter: bundle as explicit (src, dest_dir) tuples. A raw Tree() object
 # cannot be placed in Analysis.datas — it raises ValueError unpacking tuples.
 try:
-    from PyInstaller.utils.hooks import collect_dynamic_libs, collect_submodules
+    import importlib.util
+
+    from PyInstaller.utils.hooks import collect_dynamic_libs, collect_all, collect_submodules
 
     import customtkinter
+
+    extra_hiddenimports: list[str] = []
+
+    for _pkg_name in ("iopaint", "diffusers", "transformers", "accelerate"):
+        try:
+            if importlib.util.find_spec(_pkg_name) is None:
+                continue
+            d, bin_chunk, hi = collect_all(_pkg_name)
+            datas.extend(d)
+            binaries.extend(bin_chunk)
+            extra_hiddenimports.extend(hi)
+        except Exception:
+            pass
 
     _ct_root = Path(customtkinter.__file__).resolve().parent
     for _p in sorted(_ct_root.rglob("*")):
@@ -33,7 +60,7 @@ try:
         _rel = _p.relative_to(_ct_root)
         _dest_parent = Path("customtkinter") / _rel.parent
         datas.append((str(_p), str(_dest_parent).replace("\\", "/")))
-    extra_hiddenimports = list(collect_submodules("customtkinter"))
+    extra_hiddenimports.extend(collect_submodules("customtkinter"))
 except Exception as e:
     raise RuntimeError(
         "Install customtkinter before building (pip install customtkinter). "
@@ -70,7 +97,10 @@ a = Analysis(
     + extra_hiddenimports,
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=[
+        str(Path(_SPEC_ROOT) / "pyi_rth_cv2_bootstrap.py"),
+        str(Path(_SPEC_ROOT) / "pyi_rth_torch_hub_bundle.py"),
+    ],
     excludes=[
         "matplotlib",
         "jupyter",
@@ -89,20 +119,13 @@ a = Analysis(
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
-exe = EXE(
-    pyz,
-    a.scripts,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
-    [],
+_shared_exe_kwargs = dict(
     name="SpotlessFilm",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
     upx_exclude=[],
-    runtime_tmpdir=None,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -116,10 +139,27 @@ exe = EXE(
     ),
 )
 
-# macOS .app bundle only — BUNDLE is not supported on Windows/Linux
+# macOS: onedir inside .app avoids onefile extraction + security issues (PyInstaller 6+ warning).
 if sys.platform == "darwin":
-    app = BUNDLE(
+    exe = EXE(
+        pyz,
+        a.scripts,
+        [],
+        exclude_binaries=True,
+        **_shared_exe_kwargs,
+    )
+    coll = COLLECT(
         exe,
+        a.binaries,
+        a.zipfiles,
+        a.datas,
+        strip=False,
+        upx=False,
+        upx_exclude=[],
+        name="SpotlessFilm",
+    )
+    app = BUNDLE(
+        coll,
         name="SpotlessFilm.app",
         icon=(
             str(Path(_SPEC_ROOT) / "icon.icns")
@@ -131,4 +171,15 @@ if sys.platform == "darwin":
             "NSHighResolutionCapable": "True",
             "NSRequiresAquaSystemAppearance": "False",
         },
+    )
+else:
+    exe = EXE(
+        pyz,
+        a.scripts,
+        a.binaries,
+        a.zipfiles,
+        a.datas,
+        [],
+        runtime_tmpdir=None,
+        **_shared_exe_kwargs,
     )

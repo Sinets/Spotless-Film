@@ -1,9 +1,12 @@
 # Project-specific ignores
 Spotless-Film.app/
+SpotlessFilm.app/
 *.mlmodelc/
 dust_remover/
 spotless-film-app/
 build-dmg/
+# PyInstaller / packaging output under src/
+src/distribution/
 # Model files
 *.pth
 *.pt

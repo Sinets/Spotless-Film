@@ -7,31 +7,37 @@ professional UI components for advanced dust removal workflow.
 """
 
 import customtkinter as ctk
-from tkinter import filedialog, messagebox
+from tkinter import TclError, filedialog, messagebox
 from tkinterdnd2 import TkinterDnD
 import threading
 from pathlib import Path
 import sys
 from PIL import Image, ImageTk
 import numpy as np
-import torch
 import os
 import time
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Any, Final
 
 # Add current directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
 
 from dust_removal_state import DustRemovalState, ProcessingMode, ToolMode
-from ui_components import SpotlessSidebar, SpotlessToolbar, ZoomControls
-from professional_canvas import SpotlessCanvas
-from image_processing import ImageProcessingService, LamaInpainter, BrushTools, ProcessingTask, UNet
-from simple_modern_theme import SimpleModernTheme
+from i18n import I18n
+from image_processing import ImageProcessingService, LamaInpainter, BrushTools, ProcessingTask
 try:
-    from gl_image_view import GLImageView, OPENGL_AVAILABLE, GL_IMPORT_ERROR
+    from gl_image_view import OPENGL_AVAILABLE, GL_IMPORT_ERROR
 except Exception as e:
     OPENGL_AVAILABLE = False
     GL_IMPORT_ERROR = str(e)
+
+def _application_base_dir() -> Path:
+    """Bundle root (weights/, etc.). PyInstaller sets sys._MEIPASS when frozen."""
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return Path(__file__).resolve().parent
+
+# 全分辨率 LaMa/OpenCV 在超大图上可能极慢，推理前缩放到较长边≤此值，再放大回原件尺寸做 blend。
+REMOVAL_INPAINT_MAX_LONG_SIDE: Final[int] = 3072
 
 # Set appearance and theme
 ctk.set_appearance_mode("dark")
@@ -44,7 +50,9 @@ class SpotlessFilmModern:
     def __init__(self):
         # Create main window with drag-and-drop support
         self.root = TkinterDnD.Tk()
-        self.root.title("✨ Spotless Film - AI-Powered Film Restoration")
+        self.i18n = I18n.load()
+        self._section_toggle_btns: dict[str, ctk.CTkButton] = {}
+        self.root.title(self.i18n.t("window.title"))
         self.root.geometry("1400x900")
         self.root.minsize(1000, 700)
         
@@ -61,6 +69,8 @@ class SpotlessFilmModern:
         
         # Initialize split view position
         self.split_position = 0.5  # Default to middle
+        self._lama_loaded = False
+        self._lama_was_available = False
         
         # Apply professional theme (skip for CustomTkinter compatibility)
         # self.theme = SimpleModernTheme(self.root)
@@ -68,6 +78,7 @@ class SpotlessFilmModern:
         # Processing components
         self.lama_inpainter: Optional[LamaInpainter] = None
         self.processing_task: Optional[ProcessingTask] = None
+        self._removal_progress_after_id: Optional[Any] = None
         
         # Callback dictionary for UI components
         self.callbacks = {
@@ -89,6 +100,8 @@ class SpotlessFilmModern:
         
         # Setup keyboard shortcuts
         self.setup_keyboard_shortcuts()
+        
+        self.apply_i18n()
         
         print("✨ Spotless Film (Modern Professional) initialized")
 
@@ -126,61 +139,218 @@ class SpotlessFilmModern:
         # Create macOS-style sidebar content
         self.create_macos_sidebar_content()
     
+    def _section_title(self, section_id: str) -> str:
+        key = {"import": "section.import",
+               "detection": "section.detection",
+               "dust_removal": "section.dust_removal"}[section_id]
+        return self.i18n.t(key)
+
+    def _view_mode_caption(self, mode: ProcessingMode) -> str:
+        captions = {
+            ProcessingMode.SINGLE: "view.single",
+            ProcessingMode.SIDE_BY_SIDE: "view.side_by_side",
+            ProcessingMode.SPLIT_SLIDER: "view.split",
+        }
+        return self.i18n.t(captions[mode])
+
+    def _tool_eraser_caption(self, active: bool) -> str:
+        mark = "✅" if active else "⬜"
+        return f"{mark}\n{self.i18n.t('toolbar.eraser')}"
+
+    def _tool_brush_caption(self, active: bool) -> str:
+        mark = "✅" if active else "⬛"
+        return f"{mark}\n{self.i18n.t('toolbar.brush')}"
+
+    def on_language_selected(self, label: str) -> None:
+        self.i18n.set_locale(I18n.locale_from_label(label))
+        self.apply_i18n()
+
+    def update_view_buttons(self) -> None:
+        if hasattr(self, "view_cycle_btn"):
+            mode = self.state.view_state.processing_mode
+            self.view_cycle_btn.configure(text=self._view_mode_caption(mode))
+
+    def _refresh_tool_toggle_labels(self) -> None:
+        if not hasattr(self, "eraser_btn"):
+            return
+        tm = self.state.view_state.tool_mode
+        if tm == ToolMode.ERASER:
+            self.eraser_btn.configure(text=self._tool_eraser_caption(True), fg_color="#FF6B35")
+            self.brush_btn.configure(text=self._tool_brush_caption(False), fg_color="#5A5A5A")
+        elif tm == ToolMode.BRUSH:
+            self.brush_btn.configure(text=self._tool_brush_caption(True), fg_color="#4CAF50")
+            self.eraser_btn.configure(text=self._tool_eraser_caption(False), fg_color="#5A5A5A")
+        else:
+            self.eraser_btn.configure(text=self._tool_eraser_caption(False), fg_color="#5A5A5A")
+            self.brush_btn.configure(text=self._tool_brush_caption(False), fg_color="#5A5A5A")
+
+    def apply_i18n(self) -> None:
+        """Refresh all translated UI strings."""
+        self.root.title(self.i18n.t("window.title"))
+        if hasattr(self, "header_title_label"):
+            self.header_title_label.configure(text=self.i18n.t("app.title"))
+        if hasattr(self, "header_subtitle_label"):
+            self.header_subtitle_label.configure(text=self.i18n.t("app.subtitle"))
+        if hasattr(self, "language_heading_label"):
+            self.language_heading_label.configure(text=self.i18n.t("settings.language"))
+        if hasattr(self, "lang_segmented"):
+            self.lang_segmented.configure(values=I18n.language_labels())
+            self.lang_segmented.set(self.i18n.label_for_locale())
+
+        for section_id, header_btn in self._section_toggle_btns.items():
+            expanded = getattr(self, f"{section_id}_expanded", True)
+            arrow = "▼" if expanded else "▶"
+            header_btn.configure(text=f"{arrow} {self._section_title(section_id)}")
+
+        if hasattr(self, "import_status_label"):
+            has_image = self.state.selected_image is not None
+            if has_image:
+                self.import_status_label.configure(text=self.i18n.t("import.image_loaded"))
+            else:
+                self.import_status_label.configure(text=self.i18n.t("import.no_image"))
+        if hasattr(self, "size_label") and self.state.selected_image:
+            size = self.state.selected_image.size
+            self.size_label.configure(
+                text=f"{self.i18n.t('import.size')} {size[0]} x {size[1]}")
+        elif hasattr(self, "size_label"):
+            self.size_label.configure(text=f"{self.i18n.t('import.size')} --")
+        if hasattr(self, "colorspace_label") and self.state.selected_image:
+            mode = getattr(self.state.selected_image, "mode", "RGB")
+            self.colorspace_label.configure(text=f"{self.i18n.t('import.format')} {mode}")
+        elif hasattr(self, "colorspace_label"):
+            self.colorspace_label.configure(text=f"{self.i18n.t('import.format')} --")
+
+        if hasattr(self, "import_btn") and getattr(self, "_importing", False) is False:
+            self.import_btn.configure(text=self.i18n.t("import.choose_file"))
+        if hasattr(self, "detect_btn"):
+            if self.state.processing_state.is_detecting:
+                self.detect_btn.configure(text=self.i18n.t("detection.detecting"))
+            else:
+                self.detect_btn.configure(text=self.i18n.t("detection.detect"))
+        if hasattr(self, "sensitivity_heading_label"):
+            self.sensitivity_heading_label.configure(text=self.i18n.t("sensitivity.title"))
+        if hasattr(self, "sensitivity_less_label"):
+            self.sensitivity_less_label.configure(text=self.i18n.t("sensitivity.less"))
+        if hasattr(self, "sensitivity_more_label"):
+            self.sensitivity_more_label.configure(text=self.i18n.t("sensitivity.more"))
+        if hasattr(self, "sensitivity_hint_label"):
+            self.sensitivity_hint_label.configure(text=self.i18n.t("sensitivity.hint"))
+        if hasattr(self, "remove_btn"):
+            if self.state.processing_state.is_removing:
+                self.remove_btn.configure(text=self.i18n.t("removal.removing"))
+            else:
+                self.remove_btn.configure(text=self.i18n.t("removal.remove"))
+        if hasattr(self, "processing_time_heading_label"):
+            self.processing_time_heading_label.configure(text=self.i18n.t("removal.time_label"))
+
+        if hasattr(self, "brush_size_heading_label"):
+            self.brush_size_heading_label.configure(text=self.i18n.t("toolbar.size"))
+        if hasattr(self, "opacity_heading_label"):
+            self.opacity_heading_label.configure(text=self.i18n.t("toolbar.opacity"))
+        self._refresh_tool_toggle_labels()
+        self.update_view_buttons()
+
+        if hasattr(self, "overlay_toggle_btn"):
+            if getattr(self, "overlay_visible", True):
+                self.overlay_toggle_btn.configure(
+                    text=f"👁 {self.i18n.t('toolbar.overlay')}", fg_color="#007AFF")
+            else:
+                self.overlay_toggle_btn.configure(
+                    text=f"👁 {self.i18n.t('toolbar.overlay_hidden')}", fg_color="#666666")
+
+        if hasattr(self, "export_btn"):
+            self.export_btn.configure(text=self.i18n.t("toolbar.export"))
+        dev = getattr(self.state, "device", "")
+        if hasattr(self, "device_label"):
+            self.device_label.configure(text=f"{self.i18n.t('status.device')} {dev}")
+
+        if hasattr(self, "lama_label"):
+            if getattr(self, "_lama_loaded", False):
+                key = "lama.available" if self._lama_was_available else "lama.unavailable"
+                self.lama_label.configure(text=self.i18n.t(key))
+            else:
+                self.lama_label.configure(text=self.i18n.t("lama.loading"))
+
+        self.show_welcome_message()
+        if self.state.selected_image:
+            self.display_image()
+
     def create_macos_sidebar_content(self):
         """Create macOS-style sidebar content with collapsible sections"""
-        # App header with icon
         header_frame = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
         header_frame.grid(row=0, column=0, sticky="ew", padx=20, pady=(20, 10))
         
-        # App icon and title
-        title_label = ctk.CTkLabel(header_frame, text="✨ Dust Remover", 
-                                  font=ctk.CTkFont(size=18, weight="bold"))
-        title_label.pack(anchor="w")
+        self.header_title_label = ctk.CTkLabel(
+            header_frame,
+            text=self.i18n.t("app.title"),
+            font=ctk.CTkFont(size=18, weight="bold"),
+        )
+        self.header_title_label.pack(anchor="w")
         
-        subtitle_label = ctk.CTkLabel(header_frame, text="AI-powered film restoration",
-                                     font=ctk.CTkFont(size=11), text_color="#888888")
-        subtitle_label.pack(anchor="w", pady=(2, 0))
+        self.header_subtitle_label = ctk.CTkLabel(
+            header_frame,
+            text=self.i18n.t("app.subtitle"),
+            font=ctk.CTkFont(size=11),
+            text_color="#888888",
+        )
+        self.header_subtitle_label.pack(anchor="w", pady=(2, 0))
         
-        # Import section (collapsible)
-        self.create_collapsible_section("Import", 1, self.create_import_section)
+        lang_row = ctk.CTkFrame(header_frame, fg_color="transparent")
+        lang_row.pack(fill="x", pady=(14, 0))
+        self.language_heading_label = ctk.CTkLabel(
+            lang_row,
+            text=self.i18n.t("settings.language"),
+            font=ctk.CTkFont(size=11),
+            text_color="#AAAAAA",
+        )
+        self.language_heading_label.pack(side="left", padx=(0, 10))
+        self.lang_segmented = ctk.CTkSegmentedButton(
+            lang_row,
+            values=I18n.language_labels(),
+            command=self.on_language_selected,
+            height=28,
+            font=ctk.CTkFont(size=11),
+        )
+        self.lang_segmented.pack(side="left", fill="x", expand=True)
+        self.lang_segmented.set(self.i18n.label_for_locale())
         
-        # Detection section (collapsible)
-        self.create_collapsible_section("Detection", 2, self.create_detection_section)
-        
-        # Dust Removal section (collapsible)
-        self.create_collapsible_section("Dust Removal", 3, self.create_removal_section)
+        self.create_collapsible_section("import", 1, self.create_import_section)
+        self.create_collapsible_section("detection", 2, self.create_detection_section)
+        self.create_collapsible_section("dust_removal", 3, self.create_removal_section)
     
-    def create_collapsible_section(self, title, row, content_creator):
+    def create_collapsible_section(self, section_id: str, row: int, content_creator):
         """Create a collapsible section matching macOS design"""
-        # Section frame
         section_frame = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
         section_frame.grid(row=row, column=0, sticky="ew", padx=15, pady=(10, 0))
         
-        # Header button (clickable to expand/collapse)
-        header_btn = ctk.CTkButton(section_frame, text=f"▼ {title}",
-                                  font=ctk.CTkFont(size=13, weight="bold"),
-                                  fg_color="transparent", text_color="#CCCCCC",
-                                  hover_color="#3A3A3A", anchor="w", height=30)
+        header_btn = ctk.CTkButton(
+            section_frame,
+            text=f"▼ {self._section_title(section_id)}",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            fg_color="transparent",
+            text_color="#CCCCCC",
+            hover_color="#3A3A3A",
+            anchor="w",
+            height=30,
+        )
         header_btn.pack(fill="x")
         
-        # Content frame
         content_frame = ctk.CTkFrame(section_frame, fg_color="transparent")
         content_frame.pack(fill="x", pady=(5, 0))
         
-        # Store reference for toggling
-        setattr(self, f"{title.lower().replace(' ', '_')}_content", content_frame)
-        setattr(self, f"{title.lower().replace(' ', '_')}_expanded", True)
+        setattr(self, f"{section_id}_content", content_frame)
+        setattr(self, f"{section_id}_expanded", True)
+        self._section_toggle_btns[section_id] = header_btn
         
-        # Create content
         content_creator(content_frame)
         
-        # Setup toggle functionality
         def toggle_section():
-            current_state = getattr(self, f"{title.lower().replace(' ', '_')}_expanded")
+            current_state = getattr(self, f"{section_id}_expanded")
             new_state = not current_state
-            setattr(self, f"{title.lower().replace(' ', '_')}_expanded", new_state)
+            setattr(self, f"{section_id}_expanded", new_state)
             
-            header_btn.configure(text=f"{'▼' if new_state else '▶'} {title}")
+            arrow = "▼" if new_state else "▶"
+            header_btn.configure(text=f"{arrow} {self._section_title(section_id)}")
             
             if new_state:
                 content_frame.pack(fill="x", pady=(5, 0))
@@ -195,39 +365,60 @@ class SpotlessFilmModern:
         self.import_status_frame = ctk.CTkFrame(parent, fg_color="transparent")
         self.import_status_frame.pack(fill="x", pady=(0, 10))
         
-        self.import_status_label = ctk.CTkLabel(self.import_status_frame, text="○ No image selected",
-                                               font=ctk.CTkFont(size=12), text_color="#888888")
+        self.import_status_label = ctk.CTkLabel(
+            self.import_status_frame,
+            text=self.i18n.t("import.no_image"),
+            font=ctk.CTkFont(size=12),
+            text_color="#888888",
+        )
         self.import_status_label.pack(anchor="w")
         
         # Image info (always visible with placeholder)
         self.image_info_frame = ctk.CTkFrame(parent, fg_color="transparent")
         self.image_info_frame.pack(fill="x", pady=(0, 10))
         
-        self.size_label = ctk.CTkLabel(self.image_info_frame, text="Size: --",
-                                      font=ctk.CTkFont(size=10), text_color="#888888")
+        self.size_label = ctk.CTkLabel(
+            self.image_info_frame,
+            text=f"{self.i18n.t('import.size')} --",
+            font=ctk.CTkFont(size=10),
+            text_color="#888888",
+        )
         self.size_label.pack(anchor="w")
         
-        self.colorspace_label = ctk.CTkLabel(self.image_info_frame, text="Format: --",
-                                           font=ctk.CTkFont(size=10), text_color="#888888")
+        self.colorspace_label = ctk.CTkLabel(
+            self.image_info_frame,
+            text=f"{self.i18n.t('import.format')} --",
+            font=ctk.CTkFont(size=10),
+            text_color="#888888",
+        )
         self.colorspace_label.pack(anchor="w")
         
         # Choose File button
-        self.import_btn = ctk.CTkButton(parent, text="📁 Choose File",
-                                       command=self.safe_import_image,
-                                       font=ctk.CTkFont(size=12),
-                                       height=32, fg_color="#4A4A4A",
-                                       hover_color="#5A5A5A")
+        self.import_btn = ctk.CTkButton(
+            parent,
+            text=self.i18n.t("import.choose_file"),
+            command=self.safe_import_image,
+            font=ctk.CTkFont(size=12),
+            height=32,
+            fg_color="#4A4A4A",
+            hover_color="#5A5A5A",
+        )
         self.import_btn.pack(fill="x", pady=(0, 5))
         self._importing = False
     
     def create_detection_section(self, parent):
         """Create detection section content matching macOS design"""
         # Detect button
-        self.detect_btn = ctk.CTkButton(parent, text="🔍 Detect Dust",
-                                       command=self.detect_dust,
-                                       font=ctk.CTkFont(size=12),
-                                       height=32, state="disabled",
-                                       fg_color="#4A4A4A", hover_color="#5A5A5A")
+        self.detect_btn = ctk.CTkButton(
+            parent,
+            text=self.i18n.t("detection.detect"),
+            command=self.detect_dust,
+            font=ctk.CTkFont(size=12),
+            height=32,
+            state="disabled",
+            fg_color="#4A4A4A",
+            hover_color="#5A5A5A",
+        )
         self.detect_btn.pack(fill="x", pady=(0, 15))
 
         # Threshold container (used for show/hide like Swift UI)
@@ -237,9 +428,13 @@ class SpotlessFilmModern:
         # Sensitivity header with live value
         header_row = ctk.CTkFrame(self.threshold_frame, fg_color="transparent")
         header_row.pack(fill="x")
-        sensitivity_label = ctk.CTkLabel(header_row, text="🎯 Sensitivity",
-                                        font=ctk.CTkFont(size=12, weight="bold"))
+        sensitivity_label = ctk.CTkLabel(
+            header_row,
+            text=self.i18n.t("sensitivity.title"),
+            font=ctk.CTkFont(size=12, weight="bold"),
+        )
         sensitivity_label.pack(side="left")
+        self.sensitivity_heading_label = sensitivity_label
         self.threshold_value_label = ctk.CTkLabel(header_row, text=f"{self.state.processing_state.threshold:.3f}",
                                                  font=ctk.CTkFont(size=11), text_color="#CCCCCC")
         self.threshold_value_label.pack(side="right")
@@ -251,12 +446,22 @@ class SpotlessFilmModern:
         # Labels for slider
         labels_frame = ctk.CTkFrame(slider_frame, fg_color="transparent")
         labels_frame.pack(fill="x")
-        less_label = ctk.CTkLabel(labels_frame, text="Less Sensitive",
-                                 font=ctk.CTkFont(size=9), text_color="#888888")
+        less_label = ctk.CTkLabel(
+            labels_frame,
+            text=self.i18n.t("sensitivity.less"),
+            font=ctk.CTkFont(size=9),
+            text_color="#888888",
+        )
         less_label.pack(side="left")
-        more_label = ctk.CTkLabel(labels_frame, text="More Sensitive",
-                                 font=ctk.CTkFont(size=9), text_color="#888888")
+        self.sensitivity_less_label = less_label
+        more_label = ctk.CTkLabel(
+            labels_frame,
+            text=self.i18n.t("sensitivity.more"),
+            font=ctk.CTkFont(size=9),
+            text_color="#888888",
+        )
         more_label.pack(side="right")
+        self.sensitivity_more_label = more_label
 
         # Slider
         self.threshold_slider = ctk.CTkSlider(slider_frame, from_=0.001, to=0.05,
@@ -266,27 +471,42 @@ class SpotlessFilmModern:
         self.threshold_slider.pack(fill="x", pady=(5, 0))
 
         # Helper text
-        help_label = ctk.CTkLabel(self.threshold_frame, text="Adjust to fine-tune dust detection",
-                                 font=ctk.CTkFont(size=9), text_color="#666666")
+        help_label = ctk.CTkLabel(
+            self.threshold_frame,
+            text=self.i18n.t("sensitivity.hint"),
+            font=ctk.CTkFont(size=9),
+            text_color="#666666",
+        )
         help_label.pack(anchor="w", pady=(5, 0))
+        self.sensitivity_hint_label = help_label
     
     def create_removal_section(self, parent):
         """Create dust removal section content matching macOS design"""
         # Remove button
-        self.remove_btn = ctk.CTkButton(parent, text="🧹 Remove Dust",
-                                       command=self.remove_dust,
-                                       font=ctk.CTkFont(size=12),
-                                       height=32, state="disabled",
-                                       fg_color="#4A4A4A", hover_color="#5A5A5A")
+        self.remove_btn = ctk.CTkButton(
+            parent,
+            text=self.i18n.t("removal.remove"),
+            command=self.remove_dust,
+            font=ctk.CTkFont(size=12),
+            height=32,
+            state="disabled",
+            fg_color="#4A4A4A",
+            hover_color="#5A5A5A",
+        )
         self.remove_btn.pack(fill="x", pady=(0, 10))
         
         # Processing time display
         self.processing_time_frame = ctk.CTkFrame(parent, fg_color="transparent")
         self.processing_time_frame.pack(fill="x")
         
-        time_title = ctk.CTkLabel(self.processing_time_frame, text="Processing Time:",
-                                 font=ctk.CTkFont(size=10), text_color="#888888")
+        time_title = ctk.CTkLabel(
+            self.processing_time_frame,
+            text=self.i18n.t("removal.time_label"),
+            font=ctk.CTkFont(size=10),
+            text_color="#888888",
+        )
         time_title.pack(anchor="w")
+        self.processing_time_heading_label = time_title
         
         self.processing_time_label = ctk.CTkLabel(self.processing_time_frame, text="0.00s",
                                                  font=ctk.CTkFont(size=12), text_color="#CCCCCC")
@@ -411,25 +631,41 @@ class SpotlessFilmModern:
         left_tools_frame.grid(row=0, column=0, sticky="w", padx=20, pady=10)
         
         # Eraser button (square style)
-        self.eraser_btn = ctk.CTkButton(left_tools_frame, text="⬜\nEraser", width=80, height=50,
-                                       command=self.toggle_eraser_tool,
-                                       font=ctk.CTkFont(size=10),
-                                       fg_color="#5A5A5A", hover_color="#6A6A6A")
+        self.eraser_btn = ctk.CTkButton(
+            left_tools_frame,
+            text=self._tool_eraser_caption(False),
+            width=80,
+            height=50,
+            command=self.toggle_eraser_tool,
+            font=ctk.CTkFont(size=10),
+            fg_color="#5A5A5A",
+            hover_color="#6A6A6A",
+        )
         self.eraser_btn.pack(side="left", padx=(0, 8))
         
         # Brush button (square style)
-        self.brush_btn = ctk.CTkButton(left_tools_frame, text="⬛\nBrush", width=80, height=50,
-                                     command=self.toggle_brush_tool,
-                                     font=ctk.CTkFont(size=10),
-                                     fg_color="#5A5A5A", hover_color="#6A6A6A")
+        self.brush_btn = ctk.CTkButton(
+            left_tools_frame,
+            text=self._tool_brush_caption(False),
+            width=80,
+            height=50,
+            command=self.toggle_brush_tool,
+            font=ctk.CTkFont(size=10),
+            fg_color="#5A5A5A",
+            hover_color="#6A6A6A",
+        )
         self.brush_btn.pack(side="left", padx=(0, 8))
         
         # Brush size controls (conditional - only show when brush/eraser active)
         self.brush_size_frame = ctk.CTkFrame(left_tools_frame, fg_color="transparent")
         
-        self.brush_size_label_text = ctk.CTkLabel(self.brush_size_frame, text="Size:", 
-                                                 font=ctk.CTkFont(size=11), text_color="#CCCCCC")
-        self.brush_size_label_text.pack(side="left")
+        self.brush_size_heading_label = ctk.CTkLabel(
+            self.brush_size_frame,
+            text=self.i18n.t("toolbar.size"),
+            font=ctk.CTkFont(size=11),
+            text_color="#CCCCCC",
+        )
+        self.brush_size_heading_label.pack(side="left")
         
         self.brush_size_slider = ctk.CTkSlider(self.brush_size_frame, from_=5, to=100, width=120,
                                               command=self.on_brush_size_changed)
@@ -450,10 +686,16 @@ class SpotlessFilmModern:
         center_frame.grid(row=0, column=1, pady=10)
         
         # Single cycling view mode button
-        self.view_cycle_btn = ctk.CTkButton(center_frame, text="🔍 Single", width=120, height=35,
-                                           command=self.cycle_view_mode,
-                                           font=ctk.CTkFont(size=12),
-                                           fg_color="#007AFF", hover_color="#0051D0")
+        self.view_cycle_btn = ctk.CTkButton(
+            center_frame,
+            text=self._view_mode_caption(self.state.view_state.processing_mode),
+            width=120,
+            height=35,
+            command=self.cycle_view_mode,
+            font=ctk.CTkFont(size=12),
+            fg_color="#007AFF",
+            hover_color="#0051D0",
+        )
         self.view_cycle_btn.pack(side="left", padx=2)
         
         # Right side overlay controls
@@ -470,26 +712,43 @@ class SpotlessFilmModern:
         self.timer_label.pack(side="right", padx=(0, 20))
         
         # Export button
-        self.export_btn = ctk.CTkButton(overlay_frame, text="💾 Export", width=80, height=35,
-                                       command=self.export_full_resolution,
-                                       font=ctk.CTkFont(size=11),
-                                       fg_color="#28A745", hover_color="#1E7E34")
+        self.export_btn = ctk.CTkButton(
+            overlay_frame,
+            text=self.i18n.t("toolbar.export"),
+            width=80,
+            height=35,
+            command=self.export_full_resolution,
+            font=ctk.CTkFont(size=11),
+            fg_color="#28A745",
+            hover_color="#1E7E34",
+        )
         self.export_btn.pack(side="right", padx=(0, 10))
         
         # Overlay toggle button
-        self.overlay_toggle_btn = ctk.CTkButton(overlay_frame, text="👁 Overlay", width=80, height=35,
-                                              command=self.toggle_overlay,
-                                              font=ctk.CTkFont(size=11),
-                                              fg_color="#007AFF", hover_color="#0051D0")
+        self.overlay_toggle_btn = ctk.CTkButton(
+            overlay_frame,
+            text=f"👁 {self.i18n.t('toolbar.overlay')}",
+            width=80,
+            height=35,
+            command=self.toggle_overlay,
+            font=ctk.CTkFont(size=11),
+            fg_color="#007AFF",
+            hover_color="#0051D0",
+        )
         self.overlay_toggle_btn.pack(side="right", padx=(0, 10))
         
         # Opacity section
         opacity_frame = ctk.CTkFrame(overlay_frame, fg_color="transparent")
         opacity_frame.pack(side="right", padx=(0, 10))
         
-        opacity_label = ctk.CTkLabel(opacity_frame, text="Opacity",
-                                    font=ctk.CTkFont(size=10), text_color="#888888")
+        opacity_label = ctk.CTkLabel(
+            opacity_frame,
+            text=self.i18n.t("toolbar.opacity"),
+            font=ctk.CTkFont(size=10),
+            text_color="#888888",
+        )
         opacity_label.pack()
+        self.opacity_heading_label = opacity_label
         
         # Opacity slider frame
         opacity_slider_frame = ctk.CTkFrame(opacity_frame, fg_color="transparent")
@@ -520,27 +779,20 @@ class SpotlessFilmModern:
     def cycle_view_mode(self):
         """Cycle through view modes"""
         modes = [ProcessingMode.SINGLE, ProcessingMode.SIDE_BY_SIDE, ProcessingMode.SPLIT_SLIDER]
-        current_index = modes.index(self.state.view_state.processing_mode)
+        try:
+            current_index = modes.index(self.state.view_state.processing_mode)
+        except ValueError:
+            current_index = 0
         next_mode = modes[(current_index + 1) % len(modes)]
         self.set_view_mode(next_mode)
-        
-        # Update button text
-        mode_text = {
-            ProcessingMode.SINGLE: "🔍 Single",
-            ProcessingMode.SIDE_BY_SIDE: "🔄 Side by Side",
-            ProcessingMode.SPLIT_SLIDER: "✂️ Split View"
-        }
-        self.view_cycle_btn.configure(text=mode_text[next_mode])
     
     def toggle_eraser_tool(self):
         """Toggle eraser tool"""
         if self.state.view_state.tool_mode == ToolMode.ERASER:
             self.state.set_tool_mode(ToolMode.NONE)
-            self.eraser_btn.configure(text="⬜\nEraser", fg_color="#5A5A5A")
         else:
             self.state.set_tool_mode(ToolMode.ERASER)
-            self.eraser_btn.configure(text="✅\nEraser", fg_color="#FF6B35")
-            self.brush_btn.configure(text="⬛\nBrush", fg_color="#5A5A5A")
+        self._refresh_tool_toggle_labels()
         
         # Update cursor
         self.update_cursor_for_tool_change()
@@ -549,11 +801,9 @@ class SpotlessFilmModern:
         """Toggle brush tool"""
         if self.state.view_state.tool_mode == ToolMode.BRUSH:
             self.state.set_tool_mode(ToolMode.NONE)
-            self.brush_btn.configure(text="⬛\nBrush", fg_color="#5A5A5A")
         else:
             self.state.set_tool_mode(ToolMode.BRUSH)
-            self.brush_btn.configure(text="✅\nBrush", fg_color="#4CAF50")
-            self.eraser_btn.configure(text="⬜\nEraser", fg_color="#5A5A5A")
+        self._refresh_tool_toggle_labels()
         
         # Update cursor
         self.update_cursor_for_tool_change()
@@ -572,9 +822,13 @@ class SpotlessFilmModern:
         
         # Update button appearance
         if self.overlay_visible:
-            self.overlay_toggle_btn.configure(text="👁 Overlay", fg_color="#007AFF")
+            self.overlay_toggle_btn.configure(
+                text=f"👁 {self.i18n.t('toolbar.overlay')}", fg_color="#007AFF"
+            )
         else:
-            self.overlay_toggle_btn.configure(text="👁 Hidden", fg_color="#666666")
+            self.overlay_toggle_btn.configure(
+                text=f"👁 {self.i18n.t('toolbar.overlay_hidden')}", fg_color="#666666"
+            )
         
         # Refresh display
         self.display_image()
@@ -600,19 +854,31 @@ class SpotlessFilmModern:
         self.status_frame.grid_propagate(False)
         
         # Device info
-        device_text = f"Device: {self.state.device}"
-        self.device_label = ctk.CTkLabel(self.status_frame, text=device_text,
-                                        font=ctk.CTkFont(size=10), text_color="gray60")
+        device_text = f"{self.i18n.t('status.device')} {self.state.device}"
+        self.device_label = ctk.CTkLabel(
+            self.status_frame,
+            text=device_text,
+            font=ctk.CTkFont(size=10),
+            text_color="gray60",
+        )
         self.device_label.grid(row=0, column=0, sticky="w", padx=10)
         
         # Status message
-        self.status_label = ctk.CTkLabel(self.status_frame, text="Ready - Import an image to begin",
-                                        font=ctk.CTkFont(size=10), text_color="gray70")
+        self.status_label = ctk.CTkLabel(
+            self.status_frame,
+            text=self.i18n.t("status.ready"),
+            font=ctk.CTkFont(size=10),
+            text_color="gray70",
+        )
         self.status_label.grid(row=0, column=1, sticky="w", padx=10)
         
         # LaMa status
-        self.lama_label = ctk.CTkLabel(self.status_frame, text="LaMa: Loading...",
-                                      font=ctk.CTkFont(size=10), text_color="gray60")
+        self.lama_label = ctk.CTkLabel(
+            self.status_frame,
+            text=self.i18n.t("lama.loading"),
+            font=ctk.CTkFont(size=10),
+            text_color="gray60",
+        )
         self.lama_label.grid(row=0, column=2, sticky="e", padx=10)
     
     def show_welcome_message(self):
@@ -627,14 +893,34 @@ class SpotlessFilmModern:
         # Welcome text with modern styling
         self.canvas.create_text(center_x, center_y - 60, text="✨",
                                font=("Helvetica", 64), fill="#4a9eff")
-        self.canvas.create_text(center_x, center_y, text="Spotless Film",
-                               font=("Helvetica", 24, "bold"), fill="white")
-        self.canvas.create_text(center_x, center_y + 35, text="Drag and drop an image here to begin",
-                               font=("Helvetica", 14), fill="gray")
-        self.canvas.create_text(center_x, center_y + 65, text="or use the Import button",
-                               font=("Helvetica", 12), fill="gray")
-        self.canvas.create_text(center_x, center_y + 95, text="Supported formats: PNG, JPEG, TIFF, BMP",
-                               font=("Helvetica", 10), fill="#666666")
+        self.canvas.create_text(
+            center_x,
+            center_y,
+            text=self.i18n.t("canvas.title"),
+            font=("Helvetica", 24, "bold"),
+            fill="white",
+        )
+        self.canvas.create_text(
+            center_x,
+            center_y + 35,
+            text=self.i18n.t("canvas.drop_hint"),
+            font=("Helvetica", 14),
+            fill="gray",
+        )
+        self.canvas.create_text(
+            center_x,
+            center_y + 65,
+            text=self.i18n.t("canvas.import_hint"),
+            font=("Helvetica", 12),
+            fill="gray",
+        )
+        self.canvas.create_text(
+            center_x,
+            center_y + 95,
+            text=self.i18n.t("canvas.formats"),
+            font=("Helvetica", 10),
+            fill="#666666",
+        )
     
     def on_canvas_resize(self, event):
         """Handle canvas resize"""
@@ -772,19 +1058,13 @@ class SpotlessFilmModern:
                 image = self.preview_selected_image or self.state.selected_image
                 print("🖼️ Single view: Using selected image")
         else:
-            print(f"🖼️ Single view: Using provided image")
+            print("🖼️ Single view: Using provided image")
         
         if not image:
             return
         
         # Create working image from chosen source (preview/full)
         display_image = image.copy()
-        
-        # Determine if we're showing processed (for info; we now allow overlay on both)
-        is_processed_display = (
-            (self.state.processed_image is not None) and 
-            (image is self.preview_processed_image or image is self.state.processed_image)
-        )
         
         # Compute base fit size within margins
         margin = 40
@@ -859,7 +1139,13 @@ class SpotlessFilmModern:
         # Display original on left
         left_x = half_width // 2
         self.canvas.create_image(left_x, canvas_height // 2, image=self.photo_left)
-        self.canvas.create_text(left_x, 20, text="Original", fill="white", font=("Arial", 12, "bold"))
+        self.canvas.create_text(
+            left_x,
+            20,
+            text=self.i18n.t("canvas.original"),
+            fill="white",
+            font=("Arial", 12, "bold"),
+        )
         
         # Processed image (right side) if available
         if self.state.processed_image:
@@ -870,12 +1156,23 @@ class SpotlessFilmModern:
             # Display processed on right
             right_x = half_width + (half_width // 2)
             self.canvas.create_image(right_x, canvas_height // 2, image=self.photo_right)
-            self.canvas.create_text(right_x, 20, text="Processed", fill="white", font=("Arial", 12, "bold"))
+            self.canvas.create_text(
+                right_x,
+                20,
+                text=self.i18n.t("canvas.processed"),
+                fill="white",
+                font=("Arial", 12, "bold"),
+            )
         else:
             # Show placeholder text
             right_x = half_width + (half_width // 2)
-            self.canvas.create_text(right_x, canvas_height // 2, text="Process image to see result", 
-                                  fill="gray", font=("Arial", 14))
+            self.canvas.create_text(
+                right_x,
+                canvas_height // 2,
+                text=self.i18n.t("canvas.process_placeholder"),
+                fill="gray",
+                font=("Arial", 14),
+            )
         
         # Draw separator line
         self.canvas.create_line(half_width, 0, half_width, canvas_height, fill="white", width=2)
@@ -958,7 +1255,7 @@ class SpotlessFilmModern:
         display_y = canvas_height // 2
         
         # Display the composite image
-        split_item = self.canvas.create_image(display_x, display_y, image=self.photo_split)
+        self.canvas.create_image(display_x, display_y, image=self.photo_split)
         # Store bounds for tool hit-testing in split view
         self.image_item_bounds = (display_x - (cache_size[0] // 2), display_y - (cache_size[1] // 2), cache_size[0], cache_size[1])
         
@@ -975,8 +1272,20 @@ class SpotlessFilmModern:
         right_label_x = canvas_split_x + ((display_x + (cache_size[0] // 2) - canvas_split_x) // 2)
         label_y = line_y1 + 20
         
-        self.canvas.create_text(left_label_x, label_y, text="Processed", fill="white", font=("Arial", 10, "bold"))
-        self.canvas.create_text(right_label_x, label_y, text="Original", fill="white", font=("Arial", 10, "bold"))
+        self.canvas.create_text(
+            left_label_x,
+            label_y,
+            text=self.i18n.t("canvas.processed"),
+            fill="white",
+            font=("Arial", 10, "bold"),
+        )
+        self.canvas.create_text(
+            right_label_x,
+            label_y,
+            text=self.i18n.t("canvas.original"),
+            fill="white",
+            font=("Arial", 10, "bold"),
+        )
 
     def _get_split_bounds(self, canvas_width: int, canvas_height: int):
         """Return (left, top, width, height) of the split-view image rect on the canvas."""
@@ -1241,20 +1550,20 @@ class SpotlessFilmModern:
         # Update import status and image info (keep elements visible to prevent layout shifts)
         if hasattr(self, 'import_status_label'):
             if has_image:
-                self.import_status_label.configure(text="● Image Loaded", text_color="#4CAF50")
+                self.import_status_label.configure(text=self.i18n.t("import.image_loaded"), text_color="#4CAF50")
                 # Update image info
                 if hasattr(self, 'size_label') and self.state.selected_image:
                     size = self.state.selected_image.size
-                    self.size_label.configure(text=f"Size: {size[0]} x {size[1]}")
+                    self.size_label.configure(text=f"{self.i18n.t('import.size')} {size[0]} x {size[1]}")
                 if hasattr(self, 'colorspace_label'):
                     mode = getattr(self.state.selected_image, 'mode', 'RGB')
-                    self.colorspace_label.configure(text=f"Format: {mode}")
+                    self.colorspace_label.configure(text=f"{self.i18n.t('import.format')} {mode}")
             else:
-                self.import_status_label.configure(text="○ No image selected", text_color="#888888")
+                self.import_status_label.configure(text=self.i18n.t("import.no_image"), text_color="#888888")
                 if hasattr(self, 'size_label'):
-                    self.size_label.configure(text="Size: --")
+                    self.size_label.configure(text=f"{self.i18n.t('import.size')} --")
                 if hasattr(self, 'colorspace_label'):
-                    self.colorspace_label.configure(text="Format: --")
+                    self.colorspace_label.configure(text=f"{self.i18n.t('import.format')} --")
         
         # Update processing time
         if hasattr(self, 'processing_time_label') and hasattr(self.state.processing_state, 'processing_time'):
@@ -1279,6 +1588,9 @@ class SpotlessFilmModern:
         if hasattr(self, 'view_cycle_btn'):
             self.update_tool_buttons()
         
+        # Sync view-mode button label when mode changes externally
+        self.update_view_buttons()
+        
         # Display current image
         if self.state.selected_image:
             self.display_image()
@@ -1286,15 +1598,15 @@ class SpotlessFilmModern:
         # Update processing button text
         if hasattr(self, 'detect_btn'):
             if self.state.processing_state.is_detecting:
-                self.detect_btn.configure(text="🔍  Detecting...")
+                self.detect_btn.configure(text=self.i18n.t("detection.detecting"))
             else:
-                self.detect_btn.configure(text="🔍  Detect Dust")
+                self.detect_btn.configure(text=self.i18n.t("detection.detect"))
         
         if hasattr(self, 'remove_btn'):        
             if self.state.processing_state.is_removing:
-                self.remove_btn.configure(text="✨  Removing...")
+                self.remove_btn.configure(text=self.i18n.t("removal.removing"))
             else:
-                self.remove_btn.configure(text="✨  Remove Dust")
+                self.remove_btn.configure(text=self.i18n.t("removal.remove"))
     
 
     def build_preview_image(self, image, long_side: int = 2048):
@@ -1317,18 +1629,8 @@ class SpotlessFilmModern:
             return image
     
     def update_tool_buttons(self):
-        """Update tool button states"""
-        tool_mode = self.state.view_state.tool_mode
-        
-        # Reset buttons
-        self.brush_btn.configure(fg_color=("gray75", "gray25"))
-        self.eraser_btn.configure(fg_color=("gray75", "gray25"))
-        
-        # Highlight active tool
-        if tool_mode == ToolMode.BRUSH:
-            self.brush_btn.configure(fg_color=("#1f538d", "#14375e"))
-        elif tool_mode == ToolMode.ERASER:
-            self.eraser_btn.configure(fg_color=("#1f538d", "#14375e"))
+        """Update tool button states (eraser / brush labels and highlight)."""
+        self._refresh_tool_toggle_labels()
     
     def safe_import_image(self):
         """Safe wrapper for import_image to prevent multiple dialogs"""
@@ -1337,13 +1639,13 @@ class SpotlessFilmModern:
             return
         
         self._importing = True
-        self.import_btn.configure(text="📁  Loading...", state="disabled")
+        self.import_btn.configure(text=self.i18n.t("import.loading"), state="disabled")
         
         try:
             self.import_image()
         finally:
             self._importing = False
-            self.import_btn.configure(text="📁  Choose Image", state="normal")
+            self.import_btn.configure(text=self.i18n.t("import.choose_file"), state="normal")
     
     def import_image(self):
         """Import an image file"""
@@ -1351,14 +1653,14 @@ class SpotlessFilmModern:
         try:
             print("🔵 Opening file dialog...")
             file_path = filedialog.askopenfilename(
-                title="Select Image",
+                title=self.i18n.t("file.select_image"),
                 initialdir=os.path.expanduser("~"),  # Start in home directory
                 filetypes=[
-                    ("Image files", "*.jpg *.jpeg *.png *.tiff *.bmp"),
-                    ("JPEG files", "*.jpg *.jpeg"),
-                    ("PNG files", "*.png"),
-                    ("TIFF files", "*.tiff *.tif"),
-                    ("All files", "*.*")
+                    (self.i18n.t("file.image_files"), "*.jpg *.jpeg *.png *.tiff *.bmp"),
+                    (self.i18n.t("file.jpeg"), "*.jpg *.jpeg"),
+                    (self.i18n.t("file.png"), "*.png"),
+                    (self.i18n.t("file.tiff"), "*.tiff *.tif"),
+                    (self.i18n.t("file.all"), "*.*"),
                 ]
             )
             
@@ -1374,7 +1676,10 @@ class SpotlessFilmModern:
             print(f"❌ Error in import_image: {e}")
             import traceback
             traceback.print_exc()
-            messagebox.showerror("Error", f"Failed to open file dialog: {str(e)}")
+            messagebox.showerror(
+                self.i18n.t("dialog.error"),
+                self.i18n.t("dialog.file_dialog_failed", detail=str(e)),
+            )
     
     def load_image(self, file_path: str):
         """Load image from file path"""
@@ -1399,7 +1704,8 @@ class SpotlessFilmModern:
             print(f"✅ Can detect dust now: {self.state.can_detect_dust}")
             
             # Update UI
-            self.status_label.configure(text=f"Image loaded: {filename}")
+            self.status_label.configure(
+                text=self.i18n.t("status.image_loaded", name=filename))
             
             # Enable detect button
             if hasattr(self, 'detect_btn'):
@@ -1409,10 +1715,10 @@ class SpotlessFilmModern:
             self.update_ui()
             
         except Exception as e:
-            error_msg = f"Failed to load image: {str(e)}"
+            error_msg = self.i18n.t("err.load_image", detail=str(e))
             print(f"❌ {error_msg}")
             self.status_label.configure(text=error_msg, text_color="red")
-            messagebox.showerror("Error", error_msg)
+            messagebox.showerror(self.i18n.t("dialog.error"), error_msg)
     
     def handle_file_drop(self, files: List[str]):
         """Handle drag and drop files"""
@@ -1423,14 +1729,17 @@ class SpotlessFilmModern:
         if file_path.lower().endswith(('.jpg', '.jpeg', '.png', '.tiff', '.tif', '.bmp')):
             self.load_image(file_path)
         else:
-            messagebox.showerror("Error", "Please drop a valid image file")
+            messagebox.showerror(
+                self.i18n.t("dialog.error"),
+                self.i18n.t("dialog.drop_invalid"),
+            )
     
     
     # MARK: - Processing Operations
     
     def detect_dust(self):
         """Detect dust in the selected image"""
-        print(f"🔍 Detect dust called")
+        print("🔍 Detect dust called")
         print(f"🔍 Selected image: {self.state.selected_image is not None}")
         print(f"🔍 U-Net model: {self.state.unet_model is not None}")
         print(f"🔍 Is detecting: {self.state.processing_state.is_detecting}")
@@ -1448,9 +1757,9 @@ class SpotlessFilmModern:
         self.state.notify_observers()
         
         def progress_callback(progress: float):
-            self.root.after_idle(lambda: self.status_label.configure(
-                text=f"Detecting dust... {int(progress * 100)}%"
-            ))
+            pct = int(progress * 100)
+            self.root.after_idle(lambda p=pct: self.status_label.configure(
+                text=self.i18n.t("status.detect_progress", pct=p)))
         
         def completion_callback(result: np.ndarray, processing_time: float):
             try:
@@ -1472,7 +1781,10 @@ class SpotlessFilmModern:
                     self.state.save_mask_to_history()
                 
                 self.state.processing_state.is_detecting = False
-                self.status_label.configure(text=f"Dust detected in {processing_time:.2f}s", text_color="green")
+                self.status_label.configure(
+                    text=self.i18n.t("status.detect_done", time=processing_time),
+                    text_color="green",
+                )
                 self.state.notify_observers()
                 
                 print(f"✅ Dust detection completed in {processing_time:.2f}s")
@@ -1511,6 +1823,38 @@ class SpotlessFilmModern:
         
         self.processing_task.start()
     
+    def _cancel_removal_progress_updates(self) -> None:
+        if self._removal_progress_after_id is None:
+            return
+        aid = self._removal_progress_after_id
+        self._removal_progress_after_id = None
+        try:
+            self.root.after_cancel(aid)
+        except TclError:
+            pass
+
+    def _schedule_removal_progress_updates(self) -> None:
+        """Removing can take minutes on large images; refresh elapsed seconds so UI does not look frozen."""
+        self._cancel_removal_progress_updates()
+        start = time.monotonic()
+
+        def tick() -> None:
+            if not self.state.processing_state.is_removing:
+                self._removal_progress_after_id = None
+                return
+            elapsed = int(time.monotonic() - start)
+            sec_key = {"seconds": elapsed}
+            try:
+                if hasattr(self, "remove_btn"):
+                    self.remove_btn.configure(text=self.i18n.t("removal.removing_elapsed", **sec_key))
+                if hasattr(self, "status_label"):
+                    self.status_label.configure(text=self.i18n.t("status.remove_working", **sec_key))
+            except TclError:
+                pass
+            self._removal_progress_after_id = self.root.after(500, tick)
+
+        tick()
+    
     def remove_dust(self):
         """Remove dust using AI inpainting"""
         print(f"🎯 Remove dust called - can_remove_dust: {self.state.can_remove_dust}")
@@ -1538,7 +1882,11 @@ class SpotlessFilmModern:
                 # Dilate at fixed radius 5 in preview scale
                 preview_mask_dilated = ImageProcessingService.dilate_mask(preview_mask, kernel_size=5)
                 # Inpaint once on preview
-                preview_processed = self.perform_cv2_inpainting(self.preview_selected_image.convert('RGB'), preview_mask_dilated)
+                # 预览仍用 CV2，保证交互秒开；全分辨率在 perform_dust_removal 中走 LaMa
+                preview_processed = self.perform_cv2_inpainting(
+                    self.preview_selected_image.convert("RGB"),
+                    preview_mask_dilated,
+                )
                 self.preview_processed_image = preview_processed
                 # Switch view for quick feedback
                 self.state.set_processing_mode(ProcessingMode.SPLIT_SLIDER)
@@ -1552,11 +1900,13 @@ class SpotlessFilmModern:
             print(f"⚠️ Preview inpaint failed: {e}")
 
         self.state.processing_state.is_removing = True
+        self._schedule_removal_progress_updates()
         self.state.notify_observers()
         
         def completion_callback(result: Image.Image, processing_time: float):
             # Schedule GUI updates on main thread
             def update_ui():
+                self._cancel_removal_progress_updates()
                 try:
                     print(f"🎯 Completion callback called with result: {type(result)}, time: {processing_time:.2f}s")
                     self.state.processed_image = result
@@ -1565,14 +1915,17 @@ class SpotlessFilmModern:
                     self.state.processing_state.is_removing = False
                     
                     # Auto-switch to split view
-                    print(f"🎯 Switching to SPLIT_SLIDER mode...")
+                    print("🎯 Switching to SPLIT_SLIDER mode...")
                     self.state.set_processing_mode(ProcessingMode.SPLIT_SLIDER)
                     print(f"🎯 Current processing mode: {self.state.view_state.processing_mode}")
                     
-                    self.status_label.configure(text=f"Dust removed in {processing_time:.2f}s", text_color="green")
+                    self.status_label.configure(
+                        text=self.i18n.t("status.remove_done", time=processing_time),
+                        text_color="green",
+                    )
                     
                     # Force multiple UI updates to ensure refresh
-                    print(f"🎯 Forcing UI updates...")
+                    print("🎯 Forcing UI updates...")
                     self.state.notify_observers()
                     
                     # Force immediate display update with processed image
@@ -1583,11 +1936,11 @@ class SpotlessFilmModern:
                         print(f"⚠️ Failed to build processed preview: {_e}")
                     self._split_cached_signature = None
                     self.root.after_idle(lambda: self.display_image())
-                    print(f"🎯 Direct display_image update scheduled")
+                    print("🎯 Direct display_image update scheduled")
                     
                     # Force window refresh
                     self.root.after_idle(lambda: self.root.update_idletasks())
-                    print(f"🎯 Window refresh scheduled")
+                    print("🎯 Window refresh scheduled")
                     
                     print(f"✅ Dust removal completed in {processing_time:.2f}s")
                     
@@ -1616,66 +1969,87 @@ class SpotlessFilmModern:
         print("🎯 ProcessingTask started")
     
     def perform_dust_removal(self) -> Image.Image:
-        """Perform the actual dust removal process using CV2 inpainting"""
-        print(f"🎨 perform_dust_removal called")
+        """全分辨率除尘：已安装 IOPaint / lama-cleaner 时用 LaMa，否则 OpenCV TELEA。"""
+        print("🎨 perform_dust_removal called")
         print(f"🎨 Selected image available: {self.state.selected_image is not None}")
         print(f"🎨 Dust mask available: {self.state.dust_mask is not None}")
         
         if not self.state.selected_image or not self.state.dust_mask:
             raise ValueError("Missing required components for dust removal")
         
-        print("🎨 Starting CV2 inpainting process...")
+        use_lama = (
+            self.lama_inpainter is not None
+            and getattr(self.lama_inpainter, "available", False)
+        )
+        print(
+            "🎨 Inpainting (LaMa/IOPaint)…"
+            if use_lama
+            else "🎨 Inpainting（CV2 TELEA；LaMa 不可用）…"
+        )
         
         # Dilate mask for better coverage
         print("🎨 Dilating mask...")
         dilated_mask = ImageProcessingService.dilate_mask(self.state.dust_mask)
         
-        # Convert to RGB for processing
         print("🎨 Converting image to RGB...")
         image_rgb = self.state.selected_image.convert('RGB')
+
+        iw, ih = image_rgb.size
+        long_side = max(iw, ih)
+        if long_side > REMOVAL_INPAINT_MAX_LONG_SIDE:
+            scale = REMOVAL_INPAINT_MAX_LONG_SIDE / float(long_side)
+            tw = max(1, int(round(iw * scale)))
+            th = max(1, int(round(ih * scale)))
+            print(
+                f"🎨 Inpaint resize for responsiveness: ({iw}x{ih}) → ({tw}x{th}) "
+                f"(max long side={REMOVAL_INPAINT_MAX_LONG_SIDE}px)"
+            )
+            image_work = image_rgb.resize((tw, th), Image.Resampling.LANCZOS)
+            mask_work = dilated_mask.resize((tw, th), Image.Resampling.NEAREST)
+            inpainted_work = self.perform_inpainting(image_work, mask_work)
+            inpainted = inpainted_work.resize((iw, ih), Image.Resampling.LANCZOS)
+        else:
+            inpainted = self.perform_inpainting(image_rgb, dilated_mask)
         
-        # Perform CV2 inpainting using the fallback method
-        print("🎨 Performing CV2 inpainting...")
-        inpainted = self.perform_cv2_inpainting(image_rgb, dilated_mask)
-        
-        # Blend with original using mask
         print("🎨 Blending images...")
         final_result = ImageProcessingService.blend_images(
             image_rgb, inpainted, dilated_mask
         )
-        # Build preview for processed image
         self.preview_processed_image = self.build_preview_image(final_result)
         
         print("🎨 Dust removal process completed!")
         return final_result
     
+    def perform_inpainting(
+        self, image: Image.Image, mask: Image.Image
+    ) -> Image.Image:
+        """除尘修复：IOPaint/lama-cleaner LaMa / OpenCV TELEA。"""
+        lp = getattr(self, "lama_inpainter", None)
+        if lp is not None and lp.available:
+            return lp.inpaint(image, mask)
+        return LamaInpainter.cv2_inpaint_telex(image, mask, radius=5)
+
     def perform_cv2_inpainting(self, image: Image.Image, mask: Image.Image) -> Image.Image:
-        """Perform single-pass CV2 TELEA inpainting (fast)."""
-        import cv2
-        
-        # Convert PIL images to numpy arrays
-        image_np = np.array(image.convert('RGB'))
-        mask_np = np.array(mask.convert('L'))
-        
-        print(f"🔍 Image shape: {image_np.shape}, Mask shape: {mask_np.shape}")
-        result = cv2.inpaint(image_np, mask_np, inpaintRadius=5, flags=cv2.INPAINT_TELEA)
-        print("✅ CV2 single-pass inpainting completed (radius=5)")
-        return Image.fromarray(result)
+        """单遍 CV2 TELEA（与 LamaInpainter 后备一致）。"""
+        return LamaInpainter.cv2_inpaint_telex(image, mask, radius=5)
     
     def export_image(self):
         """Export processed image"""
         if not self.state.processed_image:
-            messagebox.showwarning("Warning", "No processed image to export")
+            messagebox.showwarning(
+                self.i18n.t("dialog.warning"),
+                self.i18n.t("dialog.no_export"),
+            )
             return
         
         file_path = filedialog.asksaveasfilename(
-            title="Save Processed Image",
+            title=self.i18n.t("file.save_processed"),
             defaultextension=".png",
             filetypes=[
-                ("PNG files", "*.png"),
-                ("JPEG files", "*.jpg"),
-                ("TIFF files", "*.tiff"),
-                ("All files", "*.*")
+                (self.i18n.t("file.png"), "*.png"),
+                (self.i18n.t("file.jpeg"), "*.jpg"),
+                (self.i18n.t("file.tiff"), "*.tiff"),
+                (self.i18n.t("file.all"), "*.*"),
             ]
         )
         
@@ -1689,7 +2063,7 @@ class SpotlessFilmModern:
                 
                 filename = os.path.basename(file_path)
                 print(f"✅ Image saved: {filename}")
-                self.status_label.configure(text=f"Image saved: {filename}")
+                self.status_label.configure(text=self.i18n.t("status.saved", name=filename))
                 
                 # Show in file manager
                 if os.name == 'nt':  # Windows
@@ -1710,35 +2084,6 @@ class SpotlessFilmModern:
         self.update_view_buttons()
         # Force immediate display update
         self.display_image()
-    
-    def cycle_view_mode(self):
-        """Cycle through view modes with camera button"""
-        modes = [ProcessingMode.SINGLE, ProcessingMode.SIDE_BY_SIDE, ProcessingMode.SPLIT_SLIDER]
-        current_mode = self.state.view_state.processing_mode
-        
-        try:
-            current_index = modes.index(current_mode)
-            next_index = (current_index + 1) % len(modes)
-        except ValueError:
-            next_index = 0
-        
-        next_mode = modes[next_index]
-        print(f"🖼️ Camera button: cycling from {current_mode} to {next_mode}")
-        self.set_view_mode(next_mode)
-    
-    def toggle_brush_tool(self):
-        """Toggle brush tool"""
-        if self.state.view_state.tool_mode == ToolMode.BRUSH:
-            self.state.set_tool_mode(ToolMode.NONE)
-        else:
-            self.state.set_tool_mode(ToolMode.BRUSH)
-    
-    def toggle_eraser_tool(self):
-        """Toggle eraser tool"""
-        if self.state.view_state.tool_mode == ToolMode.ERASER:
-            self.state.set_tool_mode(ToolMode.NONE)
-        else:
-            self.state.set_tool_mode(ToolMode.ERASER)
     
     def setup_keyboard_shortcuts(self):
         """Setup professional keyboard shortcuts"""
@@ -1787,7 +2132,10 @@ class SpotlessFilmModern:
     def export_full_resolution(self):
         """Export the full resolution processed image"""
         if not self.state.processed_image:
-            messagebox.showwarning("Export Warning", "No processed image to export. Please process an image first.")
+            messagebox.showwarning(
+                self.i18n.t("dialog.export_warning"),
+                self.i18n.t("dialog.no_export_detail"),
+            )
             return
         
         try:
@@ -1805,32 +2153,38 @@ class SpotlessFilmModern:
                 defaultextension=".jpg",
                 initialfile=default_name,
                 filetypes=[
-                    ("JPEG files", "*.jpg"),
-                    ("PNG files", "*.png"),
-                    ("All files", "*.*")
+                    (self.i18n.t("file.jpeg"), "*.jpg"),
+                    (self.i18n.t("file.png"), "*.png"),
+                    (self.i18n.t("file.all"), "*.*"),
                 ],
-                title="Export Full Resolution Image"
+                title=self.i18n.t("file.export_full"),
             )
             
             if file_path:
                 # Save the full resolution processed image
                 self.state.processed_image.save(file_path, quality=95)
-                messagebox.showinfo("Export Successful", f"Image exported successfully to:\n{file_path}")
+                messagebox.showinfo(
+                    self.i18n.t("dialog.export_success"),
+                    self.i18n.t("dialog.export_ok", path=file_path),
+                )
                 print(f"✅ Full resolution image exported: {file_path}")
             else:
                 print("Export cancelled by user")
                 
         except Exception as e:
             error_msg = f"Failed to export image: {str(e)}"
-            messagebox.showerror("Export Error", error_msg)
+            messagebox.showerror(self.i18n.t("dialog.export_error"), error_msg)
             print(f"❌ Export error: {e}")
     
     def toggle_compare_mode(self):
         """Cycle through compare modes"""
         modes = [ProcessingMode.SINGLE, ProcessingMode.SIDE_BY_SIDE, ProcessingMode.SPLIT_SLIDER]
-        current_index = modes.index(self.state.view_state.processing_mode)
+        try:
+            current_index = modes.index(self.state.view_state.processing_mode)
+        except ValueError:
+            current_index = 0
         next_mode = modes[(current_index + 1) % len(modes)]
-        self.state.set_processing_mode(next_mode)
+        self.set_view_mode(next_mode)
     
     def undo_mask_change(self):
         """Undo last mask change"""
@@ -1867,11 +2221,15 @@ class SpotlessFilmModern:
                         model_paths['unet'], self.state.device
                     )
                     print(f"🤖 U-Net model loaded successfully: {self.state.unet_model is not None}")
-                    self.root.after_idle(lambda: self.status_label.configure(text="U-Net model loaded"))
+                    self.root.after_idle(
+                        lambda: self.status_label.configure(
+                            text=self.i18n.t("status.unet_loaded")
+                        )
+                    )
                 else:
                     print("❌ No U-Net model file found!")
                     self.root.after_idle(lambda: self.status_label.configure(
-                        text="No model file found", text_color="red"
+                        text=self.i18n.t("status.no_model_found"), text_color="red"
                     ))
                 
                 # Initialize LaMa
@@ -1879,14 +2237,18 @@ class SpotlessFilmModern:
                 self.lama_inpainter = LamaInpainter()
                 self.state.lama_inpainter = self.lama_inpainter
                 
-                lama_status = "✅ Available" if self.lama_inpainter.available else "❌ Unavailable"
-                print(f"🤖 LaMa status: {lama_status}")
-                self.root.after_idle(lambda: self.lama_label.configure(text=f"LaMa: {lama_status}"))
+                self._lama_was_available = bool(self.lama_inpainter.available)
+                self._lama_loaded = True
+                lama_key = "lama.available" if self._lama_was_available else "lama.unavailable"
+                print(f"🤖 LaMa status: {lama_key}")
+                self.root.after_idle(
+                    lambda k=lama_key: self.lama_label.configure(text=self.i18n.t(k))
+                )
                 
                 if self.state.unet_model:
                     print("🤖 All models loaded successfully")
                     self.root.after_idle(lambda: self.status_label.configure(
-                        text="Ready - Drag image or use Import", text_color="green"
+                        text=self.i18n.t("status.ready_drag"), text_color="green"
                     ))
                 else:
                     print("❌ U-Net model failed to load")
@@ -1896,7 +2258,7 @@ class SpotlessFilmModern:
                 import traceback
                 traceback.print_exc()
                 self.root.after_idle(lambda: self.status_label.configure(
-                    text="Model loading failed", text_color="red"
+                    text=self.i18n.t("status.model_load_failed"), text_color="red"
                 ))
         
         thread = threading.Thread(target=load_models)
@@ -1907,8 +2269,9 @@ class SpotlessFilmModern:
         """Find model files - prioritize the specific weights file from main.ipynb"""
         model_paths = {'unet': None, 'lama': None}
         
+        base = _application_base_dir()
         # First, look for the exact weights file mentioned in main.ipynb
-        exact_weight_path = Path(__file__).parent / "weights" / "v5_bce_unet_epoch30.pth"
+        exact_weight_path = base / "weights" / "v5_bce_unet_epoch30.pth"
         if exact_weight_path.exists():
             model_paths['unet'] = str(exact_weight_path)
             print(f"✅ Found exact weights file: {exact_weight_path}")
@@ -1916,8 +2279,8 @@ class SpotlessFilmModern:
         
         # Fallback: search in common locations
         search_dirs = [
-            Path(__file__).parent / "weights",
-            Path(__file__).parent / "checkpoints", 
+            base / "weights",
+            base / "checkpoints", 
             Path.cwd() / "models",
             Path.cwd() / "checkpoints",
             Path.cwd() / "weights",
@@ -1947,11 +2310,15 @@ class SpotlessFilmModern:
     
     def handle_processing_error(self, error: Exception, operation: str):
         """Handle processing errors"""
+        self._cancel_removal_progress_updates()
         self.state.processing_state.is_detecting = False
         self.state.processing_state.is_removing = False
-        error_msg = f"{operation.capitalize()} failed: {str(error)}"
+        op_map = {"dust detection": "op.dust_detection", "dust removal": "op.dust_removal"}
+        op_key = op_map.get(operation.lower().strip())
+        op_label = self.i18n.t(op_key) if op_key else operation
+        error_msg = self.i18n.t("err.operation_failed", operation=op_label, detail=str(error))
         self.state.show_error(error_msg)
-        self.status_label.configure(text="Error occurred", text_color="red")
+        self.status_label.configure(text=self.i18n.t("status.error"), text_color="red")
         self.state.notify_observers()
         print(f"❌ {error_msg}")
     
@@ -2135,7 +2502,7 @@ class SpotlessFilmModern:
         if self.brush_cursor_id:
             try:
                 self.canvas.delete(self.brush_cursor_id)
-            except:
+            except Exception:
                 pass
         
         # Get brush size (actual pixel size regardless of zoom)
@@ -2184,7 +2551,7 @@ class SpotlessFilmModern:
                 self.canvas.delete("brush_cursor")
                 if self.brush_cursor_id:
                     self.canvas.delete(self.brush_cursor_id)
-            except:
+            except Exception:
                 pass
             self.brush_cursor_id = None
             self.cursor_visible = False
@@ -2197,7 +2564,7 @@ class SpotlessFilmModern:
                 try:
                     self.canvas.config(cursor="fleur")  # Panning cursor (4-way arrow)
                     print("Space pressed: panning cursor active")
-                except:
+                except Exception:
                     pass
                 self.hide_brush_cursor()
             elif hasattr(self.state, 'view_state') and self.state.view_state.tool_mode in (ToolMode.BRUSH, ToolMode.ERASER):
@@ -2205,14 +2572,14 @@ class SpotlessFilmModern:
                 try:
                     self.canvas.config(cursor="none")  # Hide default cursor
                     print(f"Tool activated: {self.state.view_state.tool_mode}, cursor hidden")
-                except:
+                except Exception:
                     pass
             else:
                 # Reset to default cursor
                 try:
                     self.canvas.config(cursor="")
                     print("Tool deactivated, cursor restored")
-                except:
+                except Exception:
                     pass
                 self.hide_brush_cursor()
 
@@ -2226,7 +2593,10 @@ class SpotlessFilmModern:
             print("\nApplication interrupted by user")
         except Exception as e:
             print(f"\nApplication error: {e}")
-            messagebox.showerror("Fatal Error", f"Application error: {e}")
+            messagebox.showerror(
+                self.i18n.t("dialog.fatal"),
+                self.i18n.t("dialog.app_error", detail=str(e)),
+            )
         finally:
             self.cleanup()
     
@@ -2261,8 +2631,24 @@ def main():
         print("   pip install customtkinter tkinterdnd2")
         print(f"   Error: {e}")
     except Exception as e:
-        print(f"Failed to start application: {e}")
-        messagebox.showerror("Startup Error", f"Failed to start application: {e}")
+        import traceback
+
+        tb = traceback.format_exc()
+        print(f"Failed to start application: {e}\n{tb}", flush=True)
+        if getattr(sys, "frozen", False):
+            try:
+                crash_log = Path.home() / "Library" / "Logs" / "SpotlessFilm-startup.log"
+                crash_log.write_text(tb, encoding="utf-8")
+            except OSError:
+                pass
+        try:
+            _i18n = I18n.load()
+            messagebox.showerror(
+                _i18n.t("dialog.startup_error"),
+                _i18n.t("dialog.start_failed", detail=str(e)),
+            )
+        except Exception:
+            messagebox.showerror("Startup Error", f"Failed to start application: {e}")
 
 if __name__ == "__main__":
     main()

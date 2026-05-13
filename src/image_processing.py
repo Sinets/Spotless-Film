@@ -8,12 +8,11 @@ Advanced image processing functions matching Spotless-Film's capabilities.
 import numpy as np
 import torch
 import torch.nn as nn
-from PIL import Image, ImageDraw
+from PIL import Image
 import cv2
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple
 import threading
 import time
-from dataclasses import dataclass
 
 
 # Import model architecture (copy from notebook)
@@ -64,69 +63,159 @@ class UNet(nn.Module):
         return torch.sigmoid(self.final(d1))
 
 
-# Try to import LaMa for deep learning inpainting
+# IOPaint（原 LaMa Cleaner）优先；不支持时再尝试旧版 lama-cleaner
 try:
-    from lama_cleaner.model_manager import ModelManager
-    from lama_cleaner.schema import Config
-    LAMA_AVAILABLE = True
+    from iopaint.model_manager import ModelManager as IOPaintModelManager
+    from iopaint.schema import InpaintRequest, HDStrategy, LDMSampler
+
+    IOPAINT_AVAILABLE = True
 except ImportError:
-    LAMA_AVAILABLE = False
+    IOPAINT_AVAILABLE = False
+    IOPaintModelManager = None  # type: ignore[misc, assignment]
+    InpaintRequest = None  # type: ignore[misc, assignment]
+    HDStrategy = None  # type: ignore[misc, assignment]
+    LDMSampler = None  # type: ignore[misc, assignment]
+
+try:
+    from lama_cleaner.model_manager import ModelManager as LegacyLamaModelManager
+    from lama_cleaner.schema import Config as LegacyLamaConfig
+
+    LEGACY_LAMA_AVAILABLE = True
+except ImportError:
+    LEGACY_LAMA_AVAILABLE = False
+    LegacyLamaModelManager = None  # type: ignore[misc, assignment]
+    LegacyLamaConfig = None  # type: ignore[misc, assignment]
 
 
 class LamaInpainter:
-    """LaMa deep learning inpainting wrapper"""
-    def __init__(self):
-        self.device = torch.device("mps" if torch.backends.mps.is_available() else 
-                                 "cuda" if torch.cuda.is_available() else "cpu")
+    """LaMa 图像修复封装：IOPaint → 旧 lama-cleaner → OpenCV."""
+
+    BACKEND_IO_PAINT = "iopaint"
+    BACKEND_LEGACY = "lama_cleaner"
+    BACKEND_NONE = "none"
+
+    def __init__(self) -> None:
+        self.device = torch.device(
+            "mps"
+            if torch.backends.mps.is_available()
+            else "cuda"
+            if torch.cuda.is_available()
+            else "cpu"
+        )
         self.available = False
-        
-        if LAMA_AVAILABLE:
+        self.backend = LamaInpainter.BACKEND_NONE
+        self.model = None  # IOPaint ModelManager | Legacy Manager
+        self._iopaint_request: Optional[object] = None
+        self._legacy_config: Optional[object] = None
+
+        if IOPAINT_AVAILABLE:
             try:
-                self.model = ModelManager(
+                assert IOPaintModelManager is not None and InpaintRequest is not None
+                assert HDStrategy is not None and LDMSampler is not None
+
+                mgr = IOPaintModelManager(
                     name="lama",
                     device=self.device,
                     no_half=False,
                     low_mem=True,
                     cpu_offload=False,
-                    disable_nsfw=True
+                    disable_nsfw_checker=True,
                 )
-                self.config = Config(
+                self._iopaint_request = InpaintRequest(
                     ldm_steps=20,
-                    ldm_sampler='plms',
-                    hd_strategy='Resize',
+                    ldm_sampler=LDMSampler.plms.value,
+                    hd_strategy=HDStrategy.RESIZE.value,
                     hd_strategy_crop_margin=32,
                     hd_strategy_crop_trigger_size=1024,
                     hd_strategy_resize_limit=2048,
                 )
+                self.model = mgr
+                self.backend = LamaInpainter.BACKEND_IO_PAINT
                 self.available = True
-                print("✅ LaMa inpainting model loaded successfully")
+                print("✅ LaMa (IOPaint) loaded successfully")
+                return
             except Exception as e:
-                print(f"Failed to load LaMa: {e}")
+                print(f"IOPaint LaMa unavailable: {e}")
+
+        if LEGACY_LAMA_AVAILABLE:
+            try:
+                assert LegacyLamaModelManager is not None and LegacyLamaConfig is not None
+                self.model = LegacyLamaModelManager(
+                    name="lama",
+                    device=self.device,
+                    no_half=False,
+                    low_mem=True,
+                    cpu_offload=False,
+                    disable_nsfw=True,
+                )
+                self._legacy_config = LegacyLamaConfig(
+                    ldm_steps=20,
+                    ldm_sampler="plms",
+                    hd_strategy="Resize",
+                    hd_strategy_crop_margin=32,
+                    hd_strategy_crop_trigger_size=1024,
+                    hd_strategy_resize_limit=2048,
+                )
+                self.backend = LamaInpainter.BACKEND_LEGACY
+                self.available = True
+                print("✅ LaMa (lama-cleaner) loaded successfully")
+            except Exception as e:
+                print(f"Legacy lama-cleaner failed: {e}")
                 self.available = False
     
     def inpaint(self, image: Image.Image, mask: Image.Image) -> Image.Image:
-        """Inpaint using LaMa or fallback to advanced CV2"""
+        """LaMa；失败或未安装时退回 OpenCV TELEA."""
         if not self.available:
             return self._fallback_inpaint(image, mask)
         
         try:
-            # Convert to numpy
-            image_np = np.array(image.convert('RGB'))
-            mask_np = np.array(mask.convert('L'))
-                
-            result = self.model(image_np, mask_np, self.config)
-            return Image.fromarray(result)
+            image_np = np.asarray(image.convert("RGB"), dtype=np.uint8)
+            mask_np = np.asarray(mask.convert("L"), dtype=np.uint8)
+            if mask_np.ndim != 2:
+                mask_np = mask_np.squeeze()
+            # 与 IOPaint erase 模型一致：255 = 修补区域；全 0 时直接跳过
+            if not mask_np.any():
+                return image.convert("RGB")
+
+            if self.backend == LamaInpainter.BACKEND_IO_PAINT:
+                assert self.model is not None and self._iopaint_request is not None
+                # ModelManager.__call__ 返回 BGR uint8
+                result_bgr = self.model(image_np, mask_np, self._iopaint_request)
+                result_rgb = cv2.cvtColor(np.asarray(result_bgr), cv2.COLOR_BGR2RGB)
+                return Image.fromarray(result_rgb)
+
+            if self.backend == LamaInpainter.BACKEND_LEGACY:
+                assert self.model is not None and self._legacy_config is not None
+                legacy_out = self.model(image_np, mask_np, self._legacy_config)
+                if hasattr(legacy_out, "convert"):
+                    return legacy_out.convert("RGB")
+                return Image.fromarray(np.asarray(legacy_out))
             
+            return self._fallback_inpaint(image, mask)
+
         except Exception as e:
             print(f"LaMa failed: {e}, falling back to CV2")
             return self._fallback_inpaint(image, mask)
+
+    @staticmethod
+    def cv2_inpaint_telex(
+        image: Image.Image,
+        mask: Image.Image,
+        radius: int = 5,
+    ) -> Image.Image:
+        """单遍 CV2 TELEA（导出给 UI 在非 LaMa 环境复用同一实现）."""
+        image_np = np.asarray(image.convert("RGB"), dtype=np.uint8)
+        mask_np = np.asarray(mask.convert("L"), dtype=np.uint8)
+        result = cv2.inpaint(
+            image_np, mask_np, inpaintRadius=radius, flags=cv2.INPAINT_TELEA
+        )
+        return Image.fromarray(result)
     
     def _fallback_inpaint(self, image: Image.Image, mask: Image.Image) -> Image.Image:
-        """Fallback to TELEA CV2 inpainting with a single pass (radius=5)."""
-        image_np = np.array(image.convert('RGB'))
-        mask_np = np.array(mask.convert('L'))
-        result = cv2.inpaint(image_np, mask_np, inpaintRadius=5, flags=cv2.INPAINT_TELEA)
-        return Image.fromarray(result)
+        """TELEA 单遍 OpenCV inpainting."""
+        out = LamaInpainter.cv2_inpaint_telex(image, mask, radius=5)
+        print("✅ Fallback CV2 TELEA inpainting (radius=5)")
+        return out
 
 
 class ImageProcessingService:
@@ -312,7 +401,7 @@ class ImageProcessingService:
         # Convert back to PIL
         result = Image.fromarray(np.clip(blended, 0, 255).astype(np.uint8))
         
-        print(f"✅ Images blended successfully")
+        print("✅ Images blended successfully")
         return result
 
 
@@ -402,7 +491,7 @@ class ProcessingTask:
     def _run(self):
         """Run the task in background thread"""
         try:
-            print(f"🧵 ProcessingTask thread started")
+            print("🧵 ProcessingTask thread started")
             start_time = time.time()
             self.result = self.target_func(*self.args, **self.kwargs)
             end_time = time.time()
@@ -411,20 +500,20 @@ class ProcessingTask:
             self.completed = True
             
             if self.callback:
-                print(f"🧵 Calling completion callback...")
+                print("🧵 Calling completion callback...")
                 self.callback(self.result, end_time - start_time)
             else:
-                print(f"🧵 No callback provided")
+                print("🧵 No callback provided")
         except Exception as e:
             print(f"🧵 ProcessingTask error: {e}")
             self.error = e
             self.completed = True
             
             if self.error_callback:
-                print(f"🧵 Calling error callback...")
+                print("🧵 Calling error callback...")
                 self.error_callback(e)
             else:
-                print(f"🧵 No error callback provided")
+                print("🧵 No error callback provided")
     
     def is_running(self) -> bool:
         """Check if task is still running"""
