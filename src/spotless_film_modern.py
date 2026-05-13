@@ -43,19 +43,13 @@ class SpotlessFilmModern:
     
     def __init__(self):
         # Create main window with drag-and-drop support
-        from frozen_diag import startup_trace_append
-
-        startup_trace_append("SpotlessFilmModern: TkinterDnD.Tk() …")
         self.root = TkinterDnD.Tk()
-        startup_trace_append("SpotlessFilmModern: root created")
         self.root.title("✨ Spotless Film - AI-Powered Film Restoration")
         self.root.geometry("1400x900")
         self.root.minsize(1000, 700)
         
         # Initialize state
-        startup_trace_append("SpotlessFilmModern: DustRemovalState …")
         self.state = DustRemovalState(self.root)
-        startup_trace_append("SpotlessFilmModern: DustRemovalState OK")
         # Preview (downscaled) images for faster display
         self.preview_selected_image = None
         self.preview_processed_image = None
@@ -88,58 +82,15 @@ class SpotlessFilmModern:
         }
         
         # Setup UI
-        startup_trace_append("SpotlessFilmModern: setup_ui …")
         self.setup_ui()
-        startup_trace_append("SpotlessFilmModern: setup_ui done")
         
         # Load models
         self.load_models_async()
         
         # Setup keyboard shortcuts
         self.setup_keyboard_shortcuts()
-
-        # Windows / RDP / multi-monitor: ensure first frame is visible (no console to debug)
-        self.root.after(0, self._present_main_window)
-
+        
         print("✨ Spotless Film (Modern Professional) initialized")
-        startup_trace_append("SpotlessFilmModern: __init__ complete, scheduled _present_main_window")
-
-    def _present_main_window(self) -> None:
-        """Center and raise window — fixes no visible UI while process stays alive on some Windows setups."""
-        try:
-            from frozen_diag import startup_trace_append
-
-            startup_trace_append("SpotlessFilmModern: _present_main_window")
-
-            self.root.update_idletasks()
-
-            w, h = 1400, 900
-            sw = max(int(self.root.winfo_screenwidth()), 800)
-            sh = max(int(self.root.winfo_screenheight()), 600)
-            x = max(0, (sw - w) // 2)
-            y = max(0, (sh - h) // 2)
-            self.root.geometry(f"{w}x{h}+{x}+{y}")
-
-            try:
-                self.root.state("normal")
-            except Exception:
-                pass
-            self.root.deiconify()
-            self.root.lift()
-
-            try:
-                self.root.attributes("-topmost", True)
-                self.root.after(250, lambda: self.root.attributes("-topmost", False))
-            except Exception:
-                pass
-            try:
-                self.root.focus_force()
-            except Exception:
-                pass
-
-            startup_trace_append("SpotlessFilmModern: window presented")
-        except Exception:
-            pass
 
     def setup_ui(self):
         """Setup the professional three-pane interface"""
@@ -2269,9 +2220,6 @@ class SpotlessFilmModern:
     
     def run(self):
         """Run the application"""
-        from frozen_diag import startup_trace_append
-
-        startup_trace_append("SpotlessFilmModern: mainloop starting")
         try:
             self.root.mainloop()
         except KeyboardInterrupt:
@@ -2293,9 +2241,6 @@ class SpotlessFilmModern:
 
 def main():
     """Main entry point"""
-    from frozen_diag import startup_trace_append
-
-    startup_trace_append("spotless Film: main() start")
     print("✨ Starting Spotless Film (Modern Professional Version)...")
     print("Features:")
     print("  • Professional three-pane macOS-style interface")
@@ -2309,9 +2254,7 @@ def main():
     print()
     
     try:
-        startup_trace_append("spotless Film: constructing SpotlessFilmModern …")
         app = SpotlessFilmModern()
-        startup_trace_append("spotless Film: constructed, entering app.run() …")
         app.run()
     except ImportError as e:
         print("❌ Missing dependencies. Please install:")

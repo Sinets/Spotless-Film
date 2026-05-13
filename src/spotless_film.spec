@@ -46,10 +46,8 @@ try:
 except Exception:
     pass
 
-# Entry script: launcher imports the real app inside try-exec so frozen builds
-# log import/setup failures instead of exiting with no UI (Windows onefile exe).
 a = Analysis(
-    ["spotless_film_launcher.py"],
+    ["spotless_film_modern.py"],
     pathex=[_SPEC_ROOT],
     binaries=binaries,
     datas=datas,
