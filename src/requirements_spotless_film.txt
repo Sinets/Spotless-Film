@@ -2,6 +2,7 @@
 # Comprehensive dependencies for the Spotless Film application
 
 # Core GUI and Windowing
+customtkinter>=5.2.0
 tkinter-dnd2>=0.3.0
 
 # Image Processing

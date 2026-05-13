@@ -25,6 +25,7 @@ jobs:
           pip install pyinstaller
           pip install -r src/requirements_spotless_film.txt
           pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          python -c "import customtkinter; import tkinterdnd2; print('GUI deps OK')"
 
       - name: PyInstaller (spec)
         working-directory: src
