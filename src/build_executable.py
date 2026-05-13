@@ -24,17 +24,24 @@ def check_dependencies():
     """Check and install required dependencies"""
     required_packages = [
         "torch",
-        "torchvision", 
+        "torchvision",
         "pillow",
         "customtkinter",
+        "tkinterdnd2",
         "opencv-python",
-        "numpy"
+        "numpy",
     ]
-    
+    import_names = {
+        "opencv-python": "cv2",
+        "pillow": "PIL",
+        "tkinterdnd2": "tkinterdnd2",
+    }
+
     missing_packages = []
     for package in required_packages:
+        mod = import_names.get(package, package.replace("-", "_"))
         try:
-            __import__(package.replace("-", "_"))
+            __import__(mod)
             print(f"✅ {package} is installed")
         except ImportError:
             missing_packages.append(package)
@@ -62,13 +69,13 @@ def build_executable():
     
     if system == "Darwin":  # macOS
         print("🍎 Building for macOS...")
-        cmd = ["pyinstaller", "--clean", "spotless_film.spec"]
+        cmd = ["pyinstaller", "--clean", "--noconfirm", "spotless_film.spec"]
     elif system == "Windows":
         print("🪟 Building for Windows...")
-        cmd = ["pyinstaller", "--clean", "spotless_film.spec"]
+        cmd = ["pyinstaller", "--clean", "--noconfirm", "spotless_film.spec"]
     else:  # Linux
         print("🐧 Building for Linux...")
-        cmd = ["pyinstaller", "--clean", "spotless_film.spec"]
+        cmd = ["pyinstaller", "--clean", "--noconfirm", "spotless_film.spec"]
     
     try:
         subprocess.check_call(cmd)

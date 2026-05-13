@@ -31,7 +31,7 @@ jobs:
       if: matrix.os == 'windows-latest'
       run: |
         cd src
-        pyinstaller --clean --onefile --windowed --name SpotlessFilm spotless_film_modern.py
+        pyinstaller --clean --noconfirm spotless_film.spec
         
     - name: Build executable (macOS)
       if: matrix.os == 'macos-latest'

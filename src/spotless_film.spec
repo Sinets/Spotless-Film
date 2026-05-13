@@ -1,45 +1,64 @@
 # -*- mode: python ; coding: utf-8 -*-
+# PyInstaller injects Analysis, PYZ, EXE, BUNDLE, COLLECT when running this file.
+import sys
+from pathlib import Path
 
 block_cipher = None
 
+datas: list[tuple[str, str]] = []
+binaries: list[tuple[str, str, str]] = []
+
+# Optional model weights shipped next to the project
+_weights = Path("weights")
+if _weights.is_dir():
+    for _w in sorted(_weights.glob("*.pth")):
+        datas.append((str(_w), "weights"))
+
+# CustomTkinter assets (themes, fonts) — required for packaged GUI on all OSes
+try:
+    from PyInstaller.utils.hooks import collect_all
+
+    _ctd, _ctb, _ct_hidden = collect_all("customtkinter")
+    datas += _ctd
+    binaries += _ctb
+    extra_hiddenimports = list(_ct_hidden)
+except Exception:
+    extra_hiddenimports = []
+
 a = Analysis(
-    ['spotless_film_modern.py'],
-    pathex=[],
-    binaries=[],
-    datas=[
-        ('weights/*.pth', 'weights'),  # Include model weights
-        ('*.py', '.'),  # Include all Python modules
-    ],
+    ["spotless_film_modern.py"],
+    pathex=[str(Path(__file__).resolve().parent)],
+    binaries=binaries,
+    datas=datas,
     hiddenimports=[
-        'torch',
-        'torchvision', 
-        'PIL',
-        'PIL.Image',
-        'PIL.ImageTk',
-        'customtkinter',
-        'tkinter',
-        'numpy',
-        'cv2',
-        'threading',
-        'dataclasses',
-        'enum',
-        'typing',
-        'lama_cleaner',
-        'lama_cleaner.model_manager',
-        'lama_cleaner.schema',
-    ],
+        "torch",
+        "torchvision",
+        "PIL",
+        "PIL.Image",
+        "PIL.ImageTk",
+        "customtkinter",
+        "tkinter",
+        "tkinterdnd2",
+        "numpy",
+        "cv2",
+        "threading",
+        "dataclasses",
+        "enum",
+        "typing",
+    ]
+    + extra_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
-        'matplotlib',
-        'jupyter',
-        'notebook',
-        'ipython',
-        'pandas',
-        'scipy',
-        'sklearn',
-        'tensorflow',
+        "matplotlib",
+        "jupyter",
+        "notebook",
+        "ipython",
+        "pandas",
+        "scipy",
+        "sklearn",
+        "tensorflow",
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
@@ -56,30 +75,31 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='SpotlessFilm',
+    name="SpotlessFilm",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=False,  # Set to True if you want console for debugging
+    console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=None,  # Add icon path here if you have one: 'icon.ico'
+    icon="icon.ico" if sys.platform == "win32" and Path("icon.ico").is_file() else None,
 )
 
-# For macOS, create an app bundle
-app = BUNDLE(
-    exe,
-    name='SpotlessFilm.app',
-    icon=None,  # Add icon path here if you have one: 'icon.icns'
-    bundle_identifier='com.spotlessfilm.app',
-    info_plist={
-        'NSHighResolutionCapable': 'True',
-        'NSRequiresAquaSystemAppearance': 'False',
-    },
-)
+# macOS .app bundle only — BUNDLE is not supported on Windows/Linux
+if sys.platform == "darwin":
+    app = BUNDLE(
+        exe,
+        name="SpotlessFilm.app",
+        icon="icon.icns" if Path("icon.icns").is_file() else None,
+        bundle_identifier="com.spotlessfilm.app",
+        info_plist={
+            "NSHighResolutionCapable": "True",
+            "NSRequiresAquaSystemAppearance": "False",
+        },
+    )
