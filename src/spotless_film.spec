@@ -19,23 +19,32 @@ if _weights.is_dir():
     for _w in sorted(_weights.glob("*.pth")):
         datas.append((str(_w), "weights"))
 
-# CustomTkinter: collect_all() often fails on Windows ("not a package"), leaving
-# the module out of the bundle → ModuleNotFoundError at runtime. Bundle the
-# installed package directory explicitly.
+# CustomTkinter: bundle as explicit (src, dest_dir) tuples. A raw Tree() object
+# cannot be placed in Analysis.datas — it raises ValueError unpacking tuples.
 try:
-    from PyInstaller.building.datastruct import Tree
-    from PyInstaller.utils.hooks import collect_submodules
+    from PyInstaller.utils.hooks import collect_dynamic_libs, collect_submodules
 
     import customtkinter
 
-    _ct_dir = os.path.dirname(os.path.abspath(customtkinter.__file__))
-    datas.append(Tree(_ct_dir, prefix="customtkinter"))
+    _ct_root = Path(customtkinter.__file__).resolve().parent
+    for _p in sorted(_ct_root.rglob("*")):
+        if not _p.is_file() or "__pycache__" in _p.parts:
+            continue
+        _rel = _p.relative_to(_ct_root)
+        _dest_parent = Path("customtkinter") / _rel.parent
+        datas.append((str(_p), str(_dest_parent).replace("\\", "/")))
     extra_hiddenimports = list(collect_submodules("customtkinter"))
 except Exception as e:
     raise RuntimeError(
         "Install customtkinter before building (pip install customtkinter). "
         f"PyInstaller could not bundle it: {e}"
     ) from e
+
+try:
+    for _tpl in collect_dynamic_libs("tkinterdnd2"):
+        binaries.append(_tpl)
+except Exception:
+    pass
 
 a = Analysis(
     ["spotless_film_modern.py"],
