@@ -19,16 +19,23 @@ if _weights.is_dir():
     for _w in sorted(_weights.glob("*.pth")):
         datas.append((str(_w), "weights"))
 
-# CustomTkinter assets (themes, fonts) — required for packaged GUI on all OSes
+# CustomTkinter: collect_all() often fails on Windows ("not a package"), leaving
+# the module out of the bundle → ModuleNotFoundError at runtime. Bundle the
+# installed package directory explicitly.
 try:
-    from PyInstaller.utils.hooks import collect_all
+    from PyInstaller.building.datastruct import Tree
+    from PyInstaller.utils.hooks import collect_submodules
 
-    _ctd, _ctb, _ct_hidden = collect_all("customtkinter")
-    datas += _ctd
-    binaries += _ctb
-    extra_hiddenimports = list(_ct_hidden)
-except Exception:
-    extra_hiddenimports = []
+    import customtkinter
+
+    _ct_dir = os.path.dirname(os.path.abspath(customtkinter.__file__))
+    datas.append(Tree(_ct_dir, prefix="customtkinter"))
+    extra_hiddenimports = list(collect_submodules("customtkinter"))
+except Exception as e:
+    raise RuntimeError(
+        "Install customtkinter before building (pip install customtkinter). "
+        f"PyInstaller could not bundle it: {e}"
+    ) from e
 
 a = Analysis(
     ["spotless_film_modern.py"],
