@@ -1,7 +1,12 @@
 # -*- mode: python ; coding: utf-8 -*-
 # PyInstaller injects Analysis, PYZ, EXE, BUNDLE, COLLECT when running this file.
+# Also: SPECPATH (spec directory), SPEC — __file__ is NOT set when the spec is exec'd.
+import os
 import sys
 from pathlib import Path
+
+# Directory containing this .spec (portable; works in CI where __file__ is undefined)
+_SPEC_ROOT = os.path.abspath(SPECPATH or os.getcwd())
 
 block_cipher = None
 
@@ -9,7 +14,7 @@ datas: list[tuple[str, str]] = []
 binaries: list[tuple[str, str, str]] = []
 
 # Optional model weights shipped next to the project
-_weights = Path("weights")
+_weights = Path(_SPEC_ROOT) / "weights"
 if _weights.is_dir():
     for _w in sorted(_weights.glob("*.pth")):
         datas.append((str(_w), "weights"))
@@ -27,7 +32,7 @@ except Exception:
 
 a = Analysis(
     ["spotless_film_modern.py"],
-    pathex=[str(Path(__file__).resolve().parent)],
+    pathex=[_SPEC_ROOT],
     binaries=binaries,
     datas=datas,
     hiddenimports=[
@@ -88,7 +93,11 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon="icon.ico" if sys.platform == "win32" and Path("icon.ico").is_file() else None,
+    icon=(
+        str(Path(_SPEC_ROOT) / "icon.ico")
+        if sys.platform == "win32" and (Path(_SPEC_ROOT) / "icon.ico").is_file()
+        else None
+    ),
 )
 
 # macOS .app bundle only — BUNDLE is not supported on Windows/Linux
@@ -96,7 +105,11 @@ if sys.platform == "darwin":
     app = BUNDLE(
         exe,
         name="SpotlessFilm.app",
-        icon="icon.icns" if Path("icon.icns").is_file() else None,
+        icon=(
+            str(Path(_SPEC_ROOT) / "icon.icns")
+            if (Path(_SPEC_ROOT) / "icon.icns").is_file()
+            else None
+        ),
         bundle_identifier="com.spotlessfilm.app",
         info_plist={
             "NSHighResolutionCapable": "True",
