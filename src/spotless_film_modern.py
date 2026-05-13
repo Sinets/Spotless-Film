@@ -2240,6 +2240,9 @@ class SpotlessFilmModern:
 
 def main():
     """Main entry point"""
+    from frozen_diag import startup_trace_append
+
+    startup_trace_append("spotless Film: main() start")
     print("✨ Starting Spotless Film (Modern Professional Version)...")
     print("Features:")
     print("  • Professional three-pane macOS-style interface")
@@ -2253,7 +2256,9 @@ def main():
     print()
     
     try:
+        startup_trace_append("spotless Film: constructing SpotlessFilmModern …")
         app = SpotlessFilmModern()
+        startup_trace_append("spotless Film: constructed, entering app.run() …")
         app.run()
     except ImportError as e:
         print("❌ Missing dependencies. Please install:")
